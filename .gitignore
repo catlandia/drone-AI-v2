@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+.venv/
+venv/
+
+# Models and logs
+models/**/*.pt
+models/**/*.json
+!models/**/.gitkeep
+logs/
+experiments/*.json
+checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

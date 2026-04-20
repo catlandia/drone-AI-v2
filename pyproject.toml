@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drone-ai"
+version = "2.0.0"
+description = "Autonomous drone delivery AI — 4-layer architecture"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "gymnasium>=0.29",
+    "scipy>=1.10",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+viz = ["pygame>=2.5", "matplotlib>=3.7"]
+train = ["tensorboard>=2.13", "stable-baselines3>=2.0"]
+all = ["drone-ai[viz,train]"]
+
+[project.scripts]
+drone-ai = "drone_ai.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
