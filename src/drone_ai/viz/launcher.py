@@ -226,23 +226,42 @@ class Launcher:
 # ---- Free-fly demo --------------------------------------------------------
 
 def _run_demo():
-    """Run the built-in DroneAI (PD controller + full 4-layer stack) with 3D viz."""
+    """Run the built-in DroneAI (PD controller + full 4-layer stack) with 3D viz.
+
+    Auto-generates a fresh mission (new obstacles + deliveries) whenever
+    the current mission finishes or the drone crashes — so the viewer
+    never just "stops flying."
+    """
     import numpy as np
     from drone_ai.drone import DroneAI
     from drone_ai.modules.manager.planner import Priority
     from drone_ai.simulation.world import World
     from drone_ai.viz.renderer3d import Renderer
 
-    drone = DroneAI(seed=0)
-    drone.reset()
-    rng = np.random.default_rng(0)
-    w = World()
-    w.generate_random_obstacles(12, rng)
-    drone.set_obstacles(w.obstacles)
-    drone.add_delivery([30.0, 20.0, 0.0], Priority.URGENT)
-    drone.add_delivery([-25.0, 35.0, 0.0], Priority.NORMAL)
-    drone.add_delivery([40.0, -30.0, 0.0], Priority.CRITICAL)
+    missions_completed = 0
+    crashes = 0
+    run_seed = [0]
 
+    def fresh_mission() -> DroneAI:
+        seed = run_seed[0]
+        run_seed[0] += 1
+        d = DroneAI(seed=seed)
+        d.reset()
+        rng = np.random.default_rng(seed)
+        w = World()
+        w.generate_random_obstacles(rng.integers(6, 14), rng)
+        d.set_obstacles(w.obstacles)
+        # Random deliveries (3-5) spread around base
+        n = int(rng.integers(3, 6))
+        priorities = [Priority.NORMAL, Priority.URGENT, Priority.CRITICAL]
+        for _ in range(n):
+            angle = float(rng.uniform(0, 2 * np.pi))
+            dist = float(rng.uniform(20, 55))
+            target = [dist * np.cos(angle), dist * np.sin(angle), 0.0]
+            d.add_delivery(target, priorities[int(rng.integers(0, 3))])
+        return d
+
+    drone = fresh_mission()
     renderer = Renderer(title="Drone AI — Free-fly Demo")
     running = True
     while running:
@@ -253,8 +272,17 @@ def _run_demo():
             for _ in range(renderer.sim_speed):
                 _, done = drone.step()
                 if done:
+                    if drone.physics.state.crashed:
+                        crashes += 1
+                    else:
+                        missions_completed += 1
+                    drone = fresh_mission()
                     break
         st = drone.get_status()
+        mgr_state = drone.manager.state
+        waypoints = [d.target for d in mgr_state.pending]
+        if mgr_state.current is not None:
+            waypoints.insert(0, mgr_state.current.target)
         hud = {
             "title":    "FREE-FLY DEMO",
             "subtitle": "4-layer stack with PD controller (no training)",
@@ -263,6 +291,8 @@ def _run_demo():
                 ("step",     str(st.step), None),
                 ("done",     str(st.deliveries_done), None),
                 ("pending",  str(st.deliveries_pending), None),
+                ("missions", str(missions_completed), None),
+                ("crashes",  str(crashes), None),
             ],
         }
         renderer.draw_scene(
@@ -271,8 +301,7 @@ def _run_demo():
             path=drone._path,
             world=drone.world,
             trail=drone._position_history,
-            waypoints=[d.target for d in drone.manager.state.pending]
-                      + ([drone.manager.state.current.target] if drone.manager.state.current else []),
+            waypoints=waypoints,
             hud=hud,
         )
         renderer.flip()

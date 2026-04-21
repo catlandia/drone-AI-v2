@@ -17,6 +17,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, List, Dict, Any, Tuple
 
+
+def _angle_diff(a: float, b: float) -> float:
+    """Shortest signed difference a-b in (-π, π]."""
+    return (a - b + np.pi) % (2 * np.pi) - np.pi
+
 from drone_ai.simulation.physics import QuadrotorPhysics, DroneState
 from drone_ai.simulation.world import World, Obstacle
 from drone_ai.modules.flycontrol.environment import FlyControlEnv, TaskType
@@ -154,7 +159,9 @@ class DroneAI:
                 self._current_delivery = chosen
                 self._target_position = chosen.target.copy()
                 self._target_position[2] = max(chosen.target[2], 8.0)
-            elif self.manager.is_complete():
+            else:
+                # Nothing to pick up: either all done, or battery too low to commit.
+                # Either way, head home — don't just hover idle.
                 if np.linalg.norm(state.position - self.BASE) > 3.0:
                     self.system_state = SystemState.RETURNING
                     self._plan_to(self.BASE + np.array([0, 0, 8]))
@@ -172,9 +179,10 @@ class DroneAI:
             done_waypoint = self._fly_step(state)
             if done_waypoint:
                 if self.system_state == SystemState.FLYING:
-                    # Reached destination
+                    # Reached destination — threshold accounts for A* grid snap (2m)
+                    # plus the waypoint-reached dist (2.5m) plus a small cushion.
                     dist_to_delivery = np.linalg.norm(state.position[:2] - self._target_position[:2])
-                    success = dist_to_delivery < 5.0
+                    success = dist_to_delivery < 8.0
                     self.manager.complete_current(success)
                     self.system_state = SystemState.IDLE
                 else:
@@ -242,41 +250,57 @@ class DroneAI:
         return self._pd_controller(state, target)
 
     def _pd_controller(self, state: DroneState, target: np.ndarray) -> np.ndarray:
-        """Cascaded position→attitude PD controller (fallback for untrained flight)."""
-        # Outer loop: position → desired acceleration
+        """Cascaded position→attitude PD controller (fallback when no trained policy)."""
+        # ---- Outer loop: position → desired world-frame acceleration ----
         pos_err = target - state.position
         vel_err = -state.velocity
-        kp_pos = np.array([0.8, 0.8, 3.0])
-        kd_pos = np.array([1.2, 1.2, 2.0])
+        kp_pos = np.array([1.2, 1.2, 4.0])
+        kd_pos = np.array([1.8, 1.8, 2.5])
         desired_acc = kp_pos * pos_err + kd_pos * vel_err
-        desired_acc = np.clip(desired_acc, -6.0, 6.0)
-        desired_acc[2] += self.physics.G  # compensate gravity
+        desired_acc = np.clip(desired_acc, -10.0, 10.0)
+        desired_acc[2] += self.physics.G  # gravity compensation
 
-        # Thrust magnitude (project desired acc onto body-z)
+        # ---- Thrust magnitude along body-z ----
         thrust_mag = self.physics.MASS * float(np.linalg.norm(desired_acc))
         thrust_norm = np.clip(thrust_mag / self.physics.MAX_THRUST, 0.0, 1.0)
 
-        # Desired roll/pitch from horizontal acceleration
-        yaw = state.orientation[2]
-        ax_body = desired_acc[0] * np.cos(yaw) + desired_acc[1] * np.sin(yaw)
-        ay_body = -desired_acc[0] * np.sin(yaw) + desired_acc[1] * np.cos(yaw)
-        desired_pitch = np.arctan2(ax_body, desired_acc[2] + 1e-6)
-        desired_roll = -np.arctan2(ay_body, desired_acc[2] + 1e-6)
-        desired_pitch = np.clip(desired_pitch, -0.4, 0.4)
-        desired_roll = np.clip(desired_roll, -0.4, 0.4)
+        # ---- Yaw target: point the camera at where we're going ----
+        # Use target direction when far away; hold heading when arriving.
+        horiz_dist = float(np.linalg.norm(pos_err[:2]))
+        if horiz_dist > 2.0:
+            desired_yaw = float(np.arctan2(pos_err[1], pos_err[0]))
+        else:
+            desired_yaw = float(state.orientation[2])
 
-        # Inner loop: attitude → angular acceleration
-        kp_att = 4.0
-        kd_att = 1.5
-        roll_cmd = kp_att * (desired_roll - state.orientation[0]) - kd_att * state.angular_velocity[0]
+        yaw = float(state.orientation[2])
+        ax_world, ay_world = float(desired_acc[0]), float(desired_acc[1])
+        # Project world-frame desired horizontal accel into yaw-rotated body frame
+        ax_body =  ax_world * np.cos(yaw) + ay_world * np.sin(yaw)
+        ay_body = -ax_world * np.sin(yaw) + ay_world * np.cos(yaw)
+
+        az = float(desired_acc[2])
+        desired_pitch = float(np.arctan2( ax_body, max(az, 1e-3)))
+        desired_roll  = float(np.arctan2(-ay_body, max(az, 1e-3)))
+        # Limit bank to ~35° — aggressive enough to accelerate but stays stable.
+        desired_pitch = float(np.clip(desired_pitch, -0.6, 0.6))
+        desired_roll  = float(np.clip(desired_roll,  -0.6, 0.6))
+
+        # ---- Inner loop: attitude → body-rate commands ----
+        kp_att = 6.0
+        kd_att = 2.0
+        kp_yaw = 2.5
+        kd_yaw = 0.8
+
+        roll_cmd  = kp_att * (desired_roll  - state.orientation[0]) - kd_att * state.angular_velocity[0]
         pitch_cmd = kp_att * (desired_pitch - state.orientation[1]) - kd_att * state.angular_velocity[1]
-        yaw_cmd = -kd_att * state.angular_velocity[2]
+        yaw_err = _angle_diff(desired_yaw, yaw)
+        yaw_cmd = kp_yaw * yaw_err - kd_yaw * state.angular_velocity[2]
 
-        # Motor mixing — signs must match physics torque equations:
+        # ---- Motor mixing (signs match physics torque equations) ----
         # roll_torque  = ( m1 - m2 - m3 + m4) * MAX_TORQUE
         # pitch_torque = (-m1 - m2 + m3 + m4) * MAX_TORQUE
         # yaw_torque   = (-m1 + m2 - m3 + m4) * YAW_TORQUE
-        k = 0.15
+        k = 0.22
         m1 = thrust_norm + k * (-pitch_cmd + roll_cmd - yaw_cmd)
         m2 = thrust_norm + k * (-pitch_cmd - roll_cmd + yaw_cmd)
         m3 = thrust_norm + k * ( pitch_cmd - roll_cmd - yaw_cmd)

@@ -36,13 +36,22 @@ GRID_AXIS_Y  = (80,  200, 80)
 SKY_TOP      = (30, 40, 55)
 SKY_BOT      = (14, 18, 26)
 
-DRONE_BODY   = (70, 180, 90)
-DRONE_BODY_D = (35, 110, 55)
-DRONE_ARM    = (50, 55, 65)
-DRONE_CANOPY = (140, 230, 170)
-MOTOR        = (30, 32, 38)
-PROP         = (210, 220, 230)
-PROP_TRAIL   = (120, 150, 180)
+DRONE_FRAME   = (28, 32, 38)     # carbon fiber top/bottom plates
+DRONE_FRAME_D = (18, 20, 24)
+DRONE_BODY    = (70, 180, 90)    # accent on arms/frame
+DRONE_BODY_D  = (35, 110, 55)
+DRONE_ARM     = (30, 34, 42)
+DRONE_BATTERY = (90, 45, 40)     # lipo strapped on top
+DRONE_BATTERY_LBL = (220, 180, 60)
+DRONE_CAMERA  = (20, 22, 28)     # camera module housing
+DRONE_LENS    = (180, 200, 220)  # lens glass
+DRONE_LED_R   = (255, 60, 60)    # rear / red
+DRONE_LED_W   = (220, 240, 255)  # front / white
+MOTOR         = (35, 38, 46)
+MOTOR_BELL    = (190, 200, 215)  # motor bell (shiny metal)
+PROP          = (210, 220, 230)
+PROP_TRAIL    = (120, 150, 180)
+ANTENNA       = (200, 170, 90)
 
 OBS_TOP      = (110, 120, 140)
 OBS_SIDE     = (85, 92, 108)
@@ -102,11 +111,15 @@ class Camera:
         self.target = pivot.copy()
         self.up = np.array([0.0, 1.0, 0.0])
 
-    def set_fpv(self, drone_pos: np.ndarray, drone_yaw: float, drone_pitch: float):
-        forward = np.array([math.cos(drone_yaw) * math.cos(drone_pitch),
-                            math.sin(drone_yaw) * math.cos(drone_pitch),
-                            math.sin(drone_pitch)])
-        self.pos = drone_pos + np.array([0.0, 0.0, 0.08])
+    def set_fpv(self, drone_pos: np.ndarray, drone_yaw: float, drone_pitch: float,
+                cam_tilt_deg: float = 30.0):
+        """FPV camera tilted up cam_tilt_deg from drone's body forward."""
+        # Combine drone pitch with camera tilt-up (negative pitch = look up)
+        effective_pitch = drone_pitch - math.radians(cam_tilt_deg)
+        forward = np.array([math.cos(drone_yaw) * math.cos(effective_pitch),
+                            math.sin(drone_yaw) * math.cos(effective_pitch),
+                            -math.sin(effective_pitch)])
+        self.pos = drone_pos + np.array([0.055, 0.0, 0.02])
         self.target = self.pos + forward * 5.0
         self.up = np.array([0.0, 0.0, 1.0])
 
@@ -447,60 +460,132 @@ class Renderer:
             self._add_line(p1, p2, OBS_EDGE, width=1)
 
     def _add_drone(self, state: DroneState):
+        """Render a 5-inch FPV freestyle quad: X-frame, camera on nose, battery on top."""
         pos = state.position
         roll, pitch, yaw = state.orientation
         R = _rotation_matrix(roll, pitch, yaw)
 
-        arm = 0.22
-        body_half = np.array([0.10, 0.10, 0.04])
-        # Body as small cuboid, rotated
-        offsets = np.array([
-            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
-            [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],
-        ], dtype=float) * body_half
-        body = [pos + R @ o for o in offsets]
-        body_faces = [
-            ([body[4], body[5], body[6], body[7]], DRONE_CANOPY),  # top
-            ([body[0], body[1], body[5], body[4]], DRONE_BODY),
-            ([body[1], body[2], body[6], body[5]], DRONE_BODY_D),
-            ([body[2], body[3], body[7], body[6]], DRONE_BODY),
-            ([body[3], body[0], body[4], body[7]], DRONE_BODY_D),
-            ([body[0], body[1], body[2], body[3]], DRONE_BODY_D),  # bottom
-        ]
-        for verts, col in body_faces:
-            self._add_poly(verts, col, fill=True)
+        # ---- Frame dimensions (5" freestyle quad, ~150mm wheelbase) ----
+        arm = 0.11                        # motor from center (X-arm half-diagonal)
+        frame_half = np.array([0.05, 0.035, 0.012])   # carbon plates half-extents
+        plate_z_low = -0.014
+        plate_z_high = 0.014
 
-        # 4 motors at X-config corners (FL, FR, RR, RL)
+        def box(center, half, R, col_top, col_side, col_bot=None):
+            c = center
+            hx, hy, hz = half
+            offs = np.array([
+                [-hx, -hy, -hz], [hx, -hy, -hz], [hx,  hy, -hz], [-hx,  hy, -hz],
+                [-hx, -hy,  hz], [hx, -hy,  hz], [hx,  hy,  hz], [-hx,  hy,  hz],
+            ])
+            v = [c + R @ o for o in offs]
+            self._add_poly([v[4], v[5], v[6], v[7]], col_top, fill=True)
+            self._add_poly([v[0], v[1], v[5], v[4]], col_side, fill=True)
+            self._add_poly([v[1], v[2], v[6], v[5]], col_side, fill=True)
+            self._add_poly([v[2], v[3], v[7], v[6]], col_side, fill=True)
+            self._add_poly([v[3], v[0], v[4], v[7]], col_side, fill=True)
+            self._add_poly([v[0], v[1], v[2], v[3]], col_bot or col_side, fill=True)
+
+        # ---- Top & bottom carbon plates ----
+        box(pos + R @ np.array([0.0, 0.0, plate_z_high]),
+            np.array([0.055, 0.04, 0.003]), R, DRONE_FRAME, DRONE_FRAME_D)
+        box(pos + R @ np.array([0.0, 0.0, plate_z_low]),
+            np.array([0.055, 0.04, 0.003]), R, DRONE_FRAME, DRONE_FRAME_D)
+
+        # ---- X-arms (4 thin bars from center to motor positions) ----
         motor_offsets = np.array([
-            [ arm,  arm, 0.0],   # front-left (world +x +y)
+            [ arm,  arm, 0.0],   # front-left
             [ arm, -arm, 0.0],   # front-right
             [-arm, -arm, 0.0],   # rear-right
             [-arm,  arm, 0.0],   # rear-left
         ])
-        for i, off in enumerate(motor_offsets):
-            world_off = R @ off
-            motor_pos = pos + world_off
-            # arm
-            self._add_line(pos, motor_pos, DRONE_ARM, width=3)
-            # motor disk — small filled ngon in rotor plane
-            prop_r = 0.13
-            n_sides = 12
-            circle_pts = []
-            for k in range(n_sides):
-                a = 2 * math.pi * k / n_sides
-                local = np.array([prop_r * math.cos(a), prop_r * math.sin(a), 0.0])
-                circle_pts.append(motor_pos + R @ local)
-            self._add_poly(circle_pts, MOTOR, fill=True)
+        for off in motor_offsets:
+            end = pos + R @ off
+            self._add_line(pos, end, DRONE_ARM, width=4)
 
-            # Spinning propeller — a pair of line arcs rotating
-            prop_phase = self._prop_phase + (i * 0.7)
-            # Draw a blurred disk (light color) + two crossing lines
-            # Two-blade prop
+        # ---- Battery pack (4S lipo) strapped to top ----
+        box(pos + R @ np.array([-0.01, 0.0, 0.030]),
+            np.array([0.055, 0.022, 0.013]), R, DRONE_BATTERY, DRONE_BATTERY, DRONE_FRAME_D)
+        # battery strap (white line across battery)
+        strap_a = pos + R @ np.array([-0.01, -0.025, 0.044])
+        strap_b = pos + R @ np.array([-0.01,  0.025, 0.044])
+        self._add_line(strap_a, strap_b, DRONE_BATTERY_LBL, width=1)
+
+        # ---- FPV camera housing + lens, tilted up ~30° ----
+        cam_tilt = math.radians(30)
+        # Camera box centered just forward of main frame
+        cam_center = pos + R @ np.array([0.055, 0.0, 0.010])
+        # Rotate camera around local Y axis (pitch axis) to tilt lens up
+        R_cam = R @ _rotation_matrix(0, -cam_tilt, 0)
+        box(cam_center, np.array([0.014, 0.016, 0.014]), R_cam,
+            DRONE_CAMERA, DRONE_CAMERA, DRONE_CAMERA)
+        # Lens: circular disk on the front face of the tilted camera
+        lens_center = cam_center + R_cam @ np.array([0.014, 0.0, 0.0])
+        lens_r = 0.010
+        lens_pts = []
+        for k in range(16):
+            a = 2 * math.pi * k / 16
+            local = np.array([0.0, lens_r * math.cos(a), lens_r * math.sin(a)])
+            lens_pts.append(lens_center + R_cam @ local)
+        self._add_poly(lens_pts, DRONE_LENS, fill=True)
+
+        # ---- Antenna sticking up-back ----
+        ant_base = pos + R @ np.array([-0.05, 0.0, 0.04])
+        ant_tip  = pos + R @ np.array([-0.08, 0.0, 0.12])
+        self._add_line(ant_base, ant_tip, ANTENNA, width=2)
+        self._add_dot(ant_tip, ANTENNA, radius=2)
+
+        # ---- LEDs (white front, red rear) ----
+        self._add_dot(pos + R @ np.array([ 0.055, -0.035, -0.002]), DRONE_LED_W, radius=2)
+        self._add_dot(pos + R @ np.array([ 0.055,  0.035, -0.002]), DRONE_LED_W, radius=2)
+        self._add_dot(pos + R @ np.array([-0.055, -0.035, -0.002]), DRONE_LED_R, radius=2)
+        self._add_dot(pos + R @ np.array([-0.055,  0.035, -0.002]), DRONE_LED_R, radius=2)
+
+        # ---- 4 motors + spinning props ----
+        for i, off in enumerate(motor_offsets):
+            motor_pos = pos + R @ off
+            # Motor stator (small dark disk)
+            stator_r = 0.014
+            stator_pts = []
+            for k in range(12):
+                a = 2 * math.pi * k / 12
+                local = np.array([stator_r * math.cos(a), stator_r * math.sin(a), 0.0])
+                stator_pts.append(motor_pos + R @ local)
+            self._add_poly(stator_pts, MOTOR, fill=True)
+            # Motor bell (slightly raised, shiny — contains the magnets)
+            bell_r = 0.011
+            bell_pts = []
+            for k in range(12):
+                a = 2 * math.pi * k / 12
+                local = np.array([bell_r * math.cos(a), bell_r * math.sin(a), 0.008])
+                bell_pts.append(motor_pos + R @ local)
+            self._add_poly(bell_pts, MOTOR_BELL, fill=True)
+
+            # Spinning propeller — throttle modulates blur radius
+            motor_throttle = float(np.clip(state.motor_state[i], 0.0, 1.0))
+            prop_r = 0.063   # 5" prop radius ≈ 0.0635 m
+            # Blur disk: faint filled polygon scaled by throttle
+            if motor_throttle > 0.05:
+                blur_col = (
+                    int(PROP_TRAIL[0] * (0.3 + 0.5 * motor_throttle)),
+                    int(PROP_TRAIL[1] * (0.3 + 0.5 * motor_throttle)),
+                    int(PROP_TRAIL[2] * (0.3 + 0.5 * motor_throttle)),
+                )
+                blur_pts = []
+                for k in range(12):
+                    a = 2 * math.pi * k / 12
+                    local = np.array([prop_r * math.cos(a), prop_r * math.sin(a), 0.014])
+                    blur_pts.append(motor_pos + R @ local)
+                self._add_poly(blur_pts, blur_col, fill=True)
+            # Two prop blades (animated)
+            prop_dir = 1.0 if i in (0, 2) else -1.0    # CCW for FL/RR, CW for FR/RL
+            prop_phase = self._prop_phase * (1.0 + 2.0 * motor_throttle) * prop_dir + i * 0.7
             for blade in range(2):
                 ang = prop_phase + blade * math.pi
-                local1 = np.array([prop_r * math.cos(ang), prop_r * math.sin(ang), 0.02])
+                local1 = np.array([prop_r * math.cos(ang),
+                                   prop_r * math.sin(ang), 0.016])
                 local2 = np.array([prop_r * math.cos(ang + math.pi),
-                                   prop_r * math.sin(ang + math.pi), 0.02])
+                                   prop_r * math.sin(ang + math.pi), 0.016])
                 self._add_line(motor_pos + R @ local1, motor_pos + R @ local2,
                                PROP, width=2)
 
