@@ -6,12 +6,14 @@ Pick a training stage (or free-fly demo) and a new window opens running it.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import pygame
 
+from drone_ai.grading import RunLogger, parse_model_name
 from drone_ai.viz.trainer_ui import STAGE_DEFS, TrainConfig, TrainerUI
 
 
@@ -66,7 +68,39 @@ STAGE_CARDS: List[StageCard] = [
 
 
 WINDOW_W = 1100
-WINDOW_H = 720
+WINDOW_H = 820
+
+RUN_LOG_PATH = "models/runs.csv"
+MODELS_ROOT = "models"
+MODULES = ("flycontrol", "manager", "pathfinder", "perception")
+
+
+def _load_recent_runs(limit: int = 5) -> List[Dict[str, str]]:
+    try:
+        rows = RunLogger(RUN_LOG_PATH).read_all()
+    except Exception:
+        rows = []
+    return rows[-limit:][::-1]
+
+
+def _latest_checkpoint_per_module() -> Dict[str, str]:
+    """Scan models/{module}/ dirs and return the newest checkpoint name per
+    module (by filename version). Returns {} if models dir missing."""
+    latest: Dict[str, str] = {}
+    for mod in MODULES:
+        mdir = os.path.join(MODELS_ROOT, mod)
+        if not os.path.isdir(mdir):
+            continue
+        best_v = -1
+        best_name = ""
+        for fname in os.listdir(mdir):
+            parsed = parse_model_name(fname)
+            if parsed and parsed["module"] == mod and parsed["version"] > best_v:
+                best_v = parsed["version"]
+                best_name = fname
+        if best_name:
+            latest[mod] = best_name
+    return latest
 
 
 class Launcher:
@@ -75,6 +109,8 @@ class Launcher:
         self.hover_idx: Optional[int] = None
         self.selected_idx: int = 0
         self.total_updates = 400  # default per-stage training budget
+        self._recent_runs: List[Dict[str, str]] = _load_recent_runs()
+        self._latest_ckpt: Dict[str, str] = _latest_checkpoint_per_module()
 
     def _init_pygame(self):
         """Idempotent pygame + window + font init.
@@ -154,6 +190,10 @@ class Launcher:
             # Reopen the launcher window. Full re-init guards against children
             # that tore down fonts or other subsystems we depend on.
             self._init_pygame()
+            # Pull in the run and checkpoint the child just wrote so the
+            # bottom strip reflects the fresh result without restarting.
+            self._recent_runs = _load_recent_runs()
+            self._latest_ckpt = _latest_checkpoint_per_module()
 
     # ---- Layout ---------------------------------------------------------
 
@@ -223,6 +263,70 @@ class Launcher:
             badge = f"{card.key}"
             b = self.font_sm.render(badge, True, TEXT_DIM)
             self.screen.blit(b, (rect.right - b.get_width() - 14, rect.bottom - 22))
+
+        # Run-log + saved-checkpoint strip across the bottom.
+        self._draw_run_strip()
+
+    def _draw_run_strip(self):
+        # Two columns: recent runs on the left, latest checkpoint per module
+        # on the right. Sits below the card grid.
+        strip_y = self.GRID_Y + 2 * (self.CARD_H + self.CARD_GAP) + 10
+        strip_h = WINDOW_H - strip_y - 20
+        strip_rect = pygame.Rect(50, strip_y, WINDOW_W - 100, strip_h)
+        pygame.draw.rect(self.screen, PANEL, strip_rect, border_radius=8)
+        pygame.draw.rect(self.screen, BORDER, strip_rect, 1, border_radius=8)
+
+        col_w = strip_rect.width // 2
+        # ---- Recent runs (left) ----
+        lx = strip_rect.x + 16
+        ly = strip_rect.y + 10
+        self.screen.blit(
+            self.font_md.render("Recent runs (models/runs.csv)", True, TEXT_TITLE),
+            (lx, ly),
+        )
+        ly += 24
+        if not self._recent_runs:
+            self.screen.blit(
+                self.font_sm.render("  no runs yet — launch a stage to record one",
+                                    True, TEXT_DIM),
+                (lx, ly),
+            )
+        else:
+            header = f"  {'date':<12}{'module':<11}{'stage':<14}{'grade':<7}{'best':>8}{'min':>7}"
+            self.screen.blit(self.font_sm.render(header, True, TEXT_DIM), (lx, ly))
+            ly += 16
+            for row in self._recent_runs:
+                line = (
+                    f"  {row.get('date',''):<12}"
+                    f"{row.get('module',''):<11}"
+                    f"{row.get('stage',''):<14}"
+                    f"{row.get('grade',''):<7}"
+                    f"{row.get('best_score',''):>8}"
+                    f"{row.get('minutes',''):>7}"
+                )
+                self.screen.blit(self.font_sm.render(line, True, TEXT), (lx, ly))
+                ly += 16
+
+        # ---- Latest checkpoints (right) ----
+        rx = strip_rect.x + col_w + 16
+        ry = strip_rect.y + 10
+        self.screen.blit(
+            self.font_md.render("Latest checkpoints (models/<module>/)", True, TEXT_TITLE),
+            (rx, ry),
+        )
+        ry += 24
+        if not self._latest_ckpt:
+            self.screen.blit(
+                self.font_sm.render("  no checkpoints yet", True, TEXT_DIM),
+                (rx, ry),
+            )
+        else:
+            for mod in MODULES:
+                name = self._latest_ckpt.get(mod)
+                label = f"  {mod:<12}{name if name else '—'}"
+                color = TEXT if name else TEXT_DIM
+                self.screen.blit(self.font_sm.render(label, True, color), (rx, ry))
+                ry += 16
 
     def _blit_wrapped(self, text: str, x: int, y: int, max_w: int, font, color):
         words = text.split(" ")
