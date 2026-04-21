@@ -16,12 +16,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-viz = ["pygame>=2.5", "matplotlib>=3.7"]
+viz = ["pygame-ce>=2.5", "matplotlib>=3.7"]
 train = ["tensorboard>=2.13", "stable-baselines3>=2.0"]
 all = ["drone-ai[viz,train]"]
 
 [project.scripts]
 drone-ai = "drone_ai.cli:main"
+drone-ai-app = "drone_ai.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

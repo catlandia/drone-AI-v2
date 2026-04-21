@@ -19,10 +19,38 @@ Each module trains independently, is graded on the same **P→W** tier list, and
 
 ---
 
-## Quick start
+## Run the app
+
+The easiest way to try it — a visual top-down simulator with a side panel of stats, click-to-add deliveries, and speed controls.
+
+**Windows:** double-click `run.bat` (first run installs deps, then it just launches).
+**macOS / Linux:** `./run.sh`
+
+Controls inside the app:
+
+| Key / Mouse | Action |
+|---|---|
+| Left click | Add NORMAL delivery at cursor |
+| Right click | Add URGENT delivery |
+| Middle click | Add CRITICAL delivery |
+| Space | Pause / resume |
+| R | Reset drone (keeps deliveries) |
+| N | New scenario (fresh obstacles) |
+| C | Clear deliveries |
+| O | +5 random obstacles |
+| 1 – 5 | Sim speed (1×, 2×, 5×, 10×, 20×) |
+| + / – | Zoom |
+| Arrows | Pan |
+| Q / Esc | Quit |
+
+---
+
+## Command-line usage
 
 ```bash
 pip install -e .
+drone-ai-app                          # launch the visual app
+drone-ai demo                         # headless demo mission
 
 # Train FlyControl (PPO with evolutionary population)
 drone-ai train flycontrol --population 6 --ages 10 --steps 10000
