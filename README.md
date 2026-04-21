@@ -21,27 +21,35 @@ Each module trains independently, is graded on the same **P→W** tier list, and
 
 ## Run the app
 
-The easiest way to try it — a visual top-down simulator with a side panel of stats, click-to-add deliveries, and speed controls.
-
 **Windows:** double-click `run.bat` (first run installs deps, then it just launches).
 **macOS / Linux:** `./run.sh`
 
-Controls inside the app:
+The launcher opens with cards for each training stage. Pick one and it spawns a **live 3D training window** — you watch your drone learn in real time.
 
-| Key / Mouse | Action |
+### Launcher
+
+| Stage | What it trains |
 |---|---|
-| Left click | Add NORMAL delivery at cursor |
-| Right click | Add URGENT delivery |
-| Middle click | Add CRITICAL delivery |
-| Space | Pause / resume |
-| R | Reset drone (keeps deliveries) |
-| N | New scenario (fresh obstacles) |
-| C | Clear deliveries |
-| O | +5 random obstacles |
-| 1 – 5 | Sim speed (1×, 2×, 5×, 10×, 20×) |
-| + / – | Zoom |
-| Arrows | Pan |
-| Q / Esc | Quit |
+| **Hover** | Basic stabilization at a target point |
+| **Waypoint** | Hover with bigger target drift |
+| **Delivery** | Pickup → dropzone, single package |
+| **Delivery Route** | Multi-stop with obstacles |
+| **Deployment Ready** | Max difficulty + domain randomization |
+| **Free-Fly Demo** | Run the full 4-layer stack with the PD controller (no training) |
+
+Use arrow keys / mouse to pick a card, Enter / click to launch. `+` / `−` adjust the training budget.
+
+### 3D training window
+
+| Key | Action |
+|---|---|
+| `1` / `2` / `3` / `4` | Camera mode: Follow / Free / FPV / Top-down |
+| Arrow keys | Orbit camera |
+| `+` / `−` | Zoom in / out |
+| `[` / `]` | Sim speed (1× → 20×) |
+| `Space` | Pause |
+| `T` / `H` | Toggle trail / HUD |
+| `Q` / `Esc` | Close window (returns to launcher) |
 
 ---
 

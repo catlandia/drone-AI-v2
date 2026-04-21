@@ -11,4 +11,4 @@ if ! "$PY" -c "import drone_ai, pygame" >/dev/null 2>&1; then
     "$PY" -m pip install -e ".[viz]"
 fi
 
-exec "$PY" -m drone_ai.app "$@"
+exec "$PY" -m drone_ai.viz.launcher "$@"

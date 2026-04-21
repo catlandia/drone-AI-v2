@@ -22,7 +22,7 @@ all = ["drone-ai[viz,train]"]
 
 [project.scripts]
 drone-ai = "drone_ai.cli:main"
-drone-ai-app = "drone_ai.app:main"
+drone-ai-app = "drone_ai.viz.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

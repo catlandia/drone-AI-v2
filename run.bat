@@ -27,6 +27,6 @@ if errorlevel 1 (
     )
 )
 
-py -m drone_ai.app %*
+py -m drone_ai.viz.launcher %*
 if errorlevel 1 pause
 endlocal
