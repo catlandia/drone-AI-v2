@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(gh api *)",
+      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/simulation\")",
+      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/flycontrol\")",
+      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/pathfinder\")",
+      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/perception\")",
+      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/manager\")",
+      "Bash(py --version)",
+      "Bash(py -c ' *)",
+      "Bash(gh auth *)",
+      "Bash(git init *)",
+      "Bash(gh repo *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(py -c \"import pygame; print\\(pygame.version.ver\\)\")",
+      "Bash(py -m pip install pygame)",
+      "Bash(py -m pip index versions pygame)",
+      "Bash(py -m pip install pygame-ce)",
+      "Bash(git push *)"
+    ]
+  }
+}
