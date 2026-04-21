@@ -71,7 +71,21 @@ WINDOW_H = 720
 
 class Launcher:
     def __init__(self):
+        self._init_pygame()
+        self.hover_idx: Optional[int] = None
+        self.selected_idx: int = 0
+        self.total_updates = 400  # default per-stage training budget
+
+    def _init_pygame(self):
+        """Idempotent pygame + window + font init.
+
+        Separated so we can call it again after launching a child window,
+        in case the child tore down subsystems we still depend on (fonts
+        are the common casualty when anything in the stack ever calls
+        pygame.quit instead of pygame.display.quit).
+        """
         pygame.init()
+        pygame.font.init()
         self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         pygame.display.set_caption("Drone AI — Launcher")
         self.clock = pygame.time.Clock()
@@ -79,18 +93,21 @@ class Launcher:
         self.font_lg = pygame.font.SysFont("Consolas", 22, bold=True)
         self.font_md = pygame.font.SysFont("Consolas", 16)
         self.font_sm = pygame.font.SysFont("Consolas", 13)
-        self.hover_idx: Optional[int] = None
-        self.selected_idx: int = 0
-        self.total_updates = 400  # default per-stage training budget
 
     def run(self) -> None:
         running = True
-        while running:
-            running = self._handle_events()
-            self._draw()
-            pygame.display.flip()
-            self.clock.tick(60)
-        pygame.quit()
+        try:
+            while running:
+                running = self._handle_events()
+                self._draw()
+                pygame.display.flip()
+                self.clock.tick(60)
+        finally:
+            # Final cleanup — only the top-level owner calls pygame.quit.
+            try:
+                pygame.quit()
+            except Exception:
+                pass
 
     # ---- Events ---------------------------------------------------------
 
@@ -122,7 +139,7 @@ class Launcher:
     # ---- Launch ---------------------------------------------------------
 
     def _launch(self, card: StageCard):
-        # Hide launcher while child runs
+        # Hide launcher while child runs.
         pygame.display.quit()
         try:
             if card.key == "demo":
@@ -130,11 +147,13 @@ class Launcher:
             else:
                 cfg = TrainConfig(stage=card.key, total_updates=self.total_updates)
                 TrainerUI(cfg).run()
+        except Exception as e:
+            # Never let a child crash kill the launcher — surface it instead.
+            print(f"[launcher] stage '{card.key}' raised: {e}")
         finally:
-            # Reopen launcher window
-            pygame.display.init()
-            self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-            pygame.display.set_caption("Drone AI — Launcher")
+            # Reopen the launcher window. Full re-init guards against children
+            # that tore down fonts or other subsystems we depend on.
+            self._init_pygame()
 
     # ---- Layout ---------------------------------------------------------
 
@@ -317,12 +336,18 @@ def main():
     args = parser.parse_args()
 
     if args.stage:
-        if args.stage == "demo":
-            _run_demo()
-        elif args.stage in STAGE_DEFS:
-            TrainerUI(TrainConfig(stage=args.stage, total_updates=args.updates)).run()
-        else:
-            print(f"Unknown stage: {args.stage}", file=sys.stderr)
+        try:
+            if args.stage == "demo":
+                _run_demo()
+            elif args.stage in STAGE_DEFS:
+                TrainerUI(TrainConfig(stage=args.stage, total_updates=args.updates)).run()
+            else:
+                print(f"Unknown stage: {args.stage}", file=sys.stderr)
+        finally:
+            try:
+                pygame.quit()
+            except Exception:
+                pass
             sys.exit(2)
     else:
         Launcher().run()

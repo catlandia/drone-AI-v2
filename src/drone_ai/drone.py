@@ -30,6 +30,7 @@ from drone_ai.modules.pathfinder.algorithms import PathPlanner
 from drone_ai.modules.perception.detector import PerceptionAI
 from drone_ai.modules.perception.tracker import ObjectTracker
 from drone_ai.modules.manager.planner import MissionPlanner, Priority
+from drone_ai.modules.adaptive import AdaptiveConfig, AdaptiveLearner
 
 
 class SystemState(Enum):
@@ -49,10 +50,12 @@ class GradeConfig:
     pathfinder: str = "P"
     perception: str = "P"
     manager: str = "P"
+    adaptive: str = "—"  # "—" = adaptive module disabled for this mission
 
     def summary(self) -> str:
         return (f"FlyControl={self.flycontrol}  Pathfinder={self.pathfinder}  "
-                f"Perception={self.perception}  Manager={self.manager}")
+                f"Perception={self.perception}  Manager={self.manager}  "
+                f"Adaptive={self.adaptive}")
 
 
 @dataclass
@@ -81,6 +84,8 @@ class DroneAI:
         flycontrol_model: Optional[str] = None,
         perception_model: Optional[str] = None,
         seed: Optional[int] = None,
+        adaptive: bool = False,
+        adaptive_config: Optional[AdaptiveConfig] = None,
     ):
         self.grades = grades or GradeConfig()
         self._rng = np.random.default_rng(seed)
@@ -104,6 +109,14 @@ class DroneAI:
         self._agent: Optional[PPOAgent] = None
         if flycontrol_model:
             self._agent = PPOAgent.from_file(flycontrol_model)
+
+        # Adaptive (5th) layer — optional. Only meaningful when a trained
+        # FlyControl agent is loaded. Fully offline: all fine-tuning happens
+        # on the drone's own compute.
+        self._adaptive: Optional[AdaptiveLearner] = None
+        if adaptive and self._agent is not None:
+            self._adaptive = AdaptiveLearner(self._agent, adaptive_config)
+            self.grades.adaptive = self.grades.adaptive if self.grades.adaptive != "—" else "A"
 
         # State
         self.system_state = SystemState.IDLE
@@ -217,14 +230,18 @@ class DroneAI:
         return False
 
     def _compute_action(self, state: DroneState, target: np.ndarray) -> np.ndarray:
-        # Build observation for the agent
+        # Build observation for the agent — MUST match FlyControlEnv._observe.
+        # All slots are sensor-realistic (no GPS, no satellites).
         from drone_ai.modules.flycontrol.environment import OBS_DIM
         _, obs_dist = self.world.nearest_obstacle(state.position)
+        # VIO-relative position: drone knows displacement from takeoff, not
+        # absolute world coordinates. BASE is the mission's takeoff anchor.
+        pos_vio = state.position - self.BASE
         rel = target - state.position
         obs = np.array([
-            state.position[0] / 50.0,
-            state.position[1] / 50.0,
-            state.position[2] / 50.0,
+            pos_vio[0] / 50.0,
+            pos_vio[1] / 50.0,
+            pos_vio[2] / 50.0,
             state.velocity[0] / 15.0,
             state.velocity[1] / 15.0,
             state.velocity[2] / 15.0,
@@ -244,7 +261,16 @@ class DroneAI:
         ], dtype=np.float32)
 
         if self._agent is not None:
-            action, _ = self._agent.select_action(obs, deterministic=True)
+            # Adaptive wraps the agent so the policy keeps improving from
+            # in-flight experience. When disabled / absent this collapses
+            # to the frozen-policy path. Actual fine-tune updates require
+            # reward feedback, which the adaptive benchmark (train.py) and
+            # the FlyControl trainer wire up; in the autonomous mission
+            # loop we only use it for stochastic action sampling.
+            if self._adaptive is not None:
+                action, _ = self._adaptive.select_action(obs, deterministic=False)
+            else:
+                action, _ = self._agent.select_action(obs, deterministic=True)
             return action
 
         return self._pd_controller(state, target)

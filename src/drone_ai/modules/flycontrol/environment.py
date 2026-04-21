@@ -1,15 +1,24 @@
 """FlyControl Gymnasium environment.
 
+All observations are restricted to what a FULLY OFFLINE drone could sense
+on its own — no GPS, no satellites, no cloud map data. Every slot below
+is annotated with the real sensor that would produce it in the field.
+
 Observation (19D):
-  [0:3]   position (normalized by 50m)
-  [3:6]   velocity (normalized by 15m/s)
-  [6:9]   orientation (roll, pitch, yaw in rad, clamped to [-π,π])
-  [9:12]  angular_velocity (normalized by 6 rad/s)
-  [12:15] target_relative (target - position, normalized by 50m)
-  [15]    distance_to_target (normalized by 100m)
-  [16]    battery (0-1)
-  [17]    nearest_obstacle_dist (normalized by 20m, clipped to 1)
-  [18]    carrying_package (0 or 1)
+  [0:3]   position_vio   — displacement since takeoff (VIO: camera+IMU).
+                            NOT absolute world XY. The drone does not know
+                            where it is on Earth, only how far it has
+                            drifted from the power-on point. Drifts slowly.
+  [3:6]   velocity       — body-linear velocity (VIO + IMU fusion).
+  [6:9]   orientation    — roll, pitch, yaw (IMU + magnetometer).
+  [9:12]  angular_velocity — gyro (IMU), very accurate.
+  [12:15] target_relative — (target - current_position). The target is
+                            a mission waypoint loaded from the flight plan
+                            BEFORE takeoff, expressed in the same VIO frame.
+  [15]    distance_to_target — derived, |target_relative|.
+  [16]    battery        — onboard battery monitor (voltage-derived).
+  [17]    nearest_obstacle_dist — camera/ToF depth, clipped at 20m.
+  [18]    carrying_package — internal state bit (cargo released or not).
 
 Action (4D): motor commands [0, 1]
 """
@@ -74,6 +83,10 @@ class FlyControlEnv(gym.Env):
         self._step: int = 0
         self._max_steps: int = 1500
         self.position_history: List[np.ndarray] = []
+        # Takeoff origin — the drone's VIO frame anchors here. The policy
+        # only ever sees positions RELATIVE to this, because a real offline
+        # drone with no GPS cannot know its absolute world coordinates.
+        self._start_position: np.ndarray = np.zeros(3)
 
         self._renderer = None
 
@@ -88,6 +101,7 @@ class FlyControlEnv(gym.Env):
 
         start = self._rng.uniform([-5, -5, 2], [5, 5, 8]).astype(np.float32)
         self.physics.reset(position=start)
+        self._start_position = start.copy()
         self._step = 0
         self.carrying = False
         self.position_history = [start.copy()]
@@ -165,11 +179,12 @@ class FlyControlEnv(gym.Env):
         reward = 0.0
         done = False
 
-        # Crash penalty — kept modest so a single hard landing doesn't
-        # dominate the gradient for the whole episode. Autonomy training
-        # needs the drone to dare to explore, not cower.
+        # Crash penalty — real custom FPV drones are expensive and slow to
+        # rebuild, so crashing is NOT cheap. Kept high (not the highest
+        # possible) so the policy learns to avoid it, while still allowing
+        # exploration through hover-biased init and lowered log_std.
         if state.crashed:
-            return -20.0, True
+            return -50.0, True
 
         # Out-of-bounds soft penalty
         if not self.world.in_bounds(pos):
@@ -218,11 +233,14 @@ class FlyControlEnv(gym.Env):
     def _observe(self) -> np.ndarray:
         s = self.physics.state
         _, obs_dist = self.world.nearest_obstacle(s.position)
-        rel = self.target - s.position
+        # VIO-relative position: the drone only knows how far it has moved
+        # since takeoff, not its absolute world coordinates. NO GPS.
+        pos_vio = s.position - self._start_position
+        rel = self.target - s.position  # target was set in sim world = VIO world
         obs = np.array([
-            s.position[0] / 50.0,
-            s.position[1] / 50.0,
-            s.position[2] / 50.0,
+            pos_vio[0] / 50.0,
+            pos_vio[1] / 50.0,
+            pos_vio[2] / 50.0,
             s.velocity[0] / 15.0,
             s.velocity[1] / 15.0,
             s.velocity[2] / 15.0,

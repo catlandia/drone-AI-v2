@@ -697,8 +697,15 @@ class Renderer:
         self.clock.tick(60)
 
     def close(self):
+        """Tear down the display window only — do NOT pygame.quit().
+
+        pygame.quit() releases font + all subsystems, which breaks any
+        OTHER pygame object the parent (e.g. the Launcher) still holds.
+        Callers that own the process (top-level entry points) are the
+        ones that should call pygame.quit(), not the renderer.
+        """
         try:
-            pygame.quit()
+            pygame.display.quit()
         except Exception:
             pass
 

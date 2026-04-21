@@ -81,9 +81,10 @@ class QuadrotorPhysics:
     DT = 0.02                    # s (50 Hz)
     MAX_VEL = 28.0               # m/s clamp (real FPV can do 30+)
     MAX_ANG_VEL = 14.0           # rad/s clamp (real FPV can do 17+)
-    # FPV drones can invert and recover — we DON'T crash on tilt alone.
-    # Only a hard ground impact or sustained total loss of control terminates.
-    HARD_IMPACT_VZ = 8.0         # m/s downward into ground = crash
+    # Crash conditions. Custom FPV drones are expensive and slow to rebuild,
+    # so crashing is a real event, not a soft reset.
+    HARD_IMPACT_VZ = 8.0         # m/s into ground = crash
+    INVERSION_TILT = np.pi / 2   # ±90°: propellers pointing down → dead
 
     def __init__(self, dt: float = DT):
         self.dt = dt
@@ -177,13 +178,18 @@ class QuadrotorPhysics:
                 self.state.velocity[0] *= 0.6
                 self.state.velocity[1] *= 0.6
 
-        # Tilt-based crashes are intentionally OMITTED — FPV quads regularly
-        # invert during flips and recover. The drone will ultimately be
-        # punished (if at all) by hitting the ground, not by geometry.
-        # Wrap roll/pitch to (-π, π] to keep the representation bounded.
+        # Wrap roll/pitch to (-π, π] BEFORE the inversion check — otherwise
+        # integrating past ±π wraps around silently and the crash never fires.
         for i in (0, 1):
             a = self.state.orientation[i]
             self.state.orientation[i] = (a + np.pi) % (2 * np.pi) - np.pi
+
+        # Inversion crash: props pointing down (|roll| ≥ 90° or |pitch| ≥ 90°)
+        # means the thrust vector cannot push the drone up anymore. A real
+        # bespoke FPV quad at that attitude is going down; treat it as dead.
+        if (np.abs(self.state.orientation[0]) >= self.INVERSION_TILT or
+                np.abs(self.state.orientation[1]) >= self.INVERSION_TILT):
+            self.state.crashed = True
 
         # 13. Battery drain proportional to mean throttle.
         self.state.battery = max(0.0, self.state.battery - self.BATTERY_DRAIN * float(np.mean(m)))

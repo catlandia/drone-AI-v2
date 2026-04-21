@@ -2,13 +2,18 @@
 
 Model naming convention: {Grade} {DD-MM-YYYY} {module} v{N}.pt
 Example: A+ 20-04-2026 flycontrol v1.pt
+
+Every training or evaluation run should also be appended to the combined
+run log (see RunLogger) so runs can be compared over time — the user cares
+about how much each tweak actually moves the score.
 """
 
+import csv
 import re
 import os
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 GRADE_ORDER = [
@@ -83,6 +88,17 @@ class ManagerMetrics:
     battery_waste: float       # wasted battery fraction (0-1, lower is better)
 
 
+@dataclass
+class AdaptiveMetricsGrading:
+    """Grade the Adaptive module by how much it improves a policy in the
+    field. Measured as the delta between frozen and adapted rewards on
+    an out-of-distribution environment."""
+    baseline_score: float      # avg episode reward with adaptation OFF
+    adapted_score: float       # avg episode reward with adaptation ON
+    recovery_rate: float       # (adapted - baseline) / max(|baseline|, 1)
+    stability: float           # 1 - stddev(adapted) / (|mean|+1), clipped 0..1
+
+
 def score_flycontrol(metrics: FlyControlMetrics) -> float:
     weights = {"hover": 0.15, "delivery": 0.25, "route": 0.30, "deploy": 0.30}
     return (
@@ -114,6 +130,16 @@ def score_manager(metrics: ManagerMetrics) -> float:
     priority = metrics.priority_score * 150
     battery = (1.0 - metrics.battery_waste) * 50
     return completion + efficiency + priority + battery
+
+
+def score_adaptive(metrics: AdaptiveMetricsGrading) -> float:
+    """Adaptive score = how much it recovered performance on OOD tasks,
+    plus a stability bonus so a wildly-oscillating learner doesn't grade
+    well just because its average recovered."""
+    recovery = max(0.0, metrics.recovery_rate) * 500.0
+    delta = max(0.0, metrics.adapted_score - metrics.baseline_score) * 0.5
+    stability = max(0.0, min(1.0, metrics.stability)) * 100.0
+    return recovery + delta + stability
 
 
 _FLYCONTROL_THRESHOLDS = [
@@ -159,6 +185,10 @@ class ModelGrader:
 
     def grade_manager(self, metrics: ManagerMetrics) -> Tuple[str, float]:
         score = score_manager(metrics)
+        return _score_to_grade(score, _UNIVERSAL_THRESHOLDS), score
+
+    def grade_adaptive(self, metrics: AdaptiveMetricsGrading) -> Tuple[str, float]:
+        score = score_adaptive(metrics)
         return _score_to_grade(score, _UNIVERSAL_THRESHOLDS), score
 
     def report(self, module: str, grade: str, score: float) -> str:
@@ -220,3 +250,90 @@ def grade_index(grade: str) -> int:
         return GRADE_ORDER.index(grade)
     except ValueError:
         return len(GRADE_ORDER)
+
+
+# ---- Run log --------------------------------------------------------------
+# Single append-only CSV that combines every field the user asked for:
+# date, minutes trained, numeric score, letter tier, stage, module, run tag.
+# The file sits at models/runs.csv so it's easy to diff between tweaks.
+
+RUN_LOG_FIELDS = [
+    "timestamp_iso",
+    "date",           # DD-MM-YYYY (matches model filename convention)
+    "minutes",        # wall-clock training duration, float with one decimal
+    "module",         # flycontrol / pathfinder / perception / manager / adaptive
+    "stage",          # hover / delivery / ... / eval
+    "best_score",     # best numeric score observed in the run
+    "avg_score",      # average score across the run
+    "grade",          # letter tier (P..W) derived from best_score
+    "updates",        # number of PPO/grad updates (or 0 for pure eval)
+    "episodes",       # episodes completed
+    "run_tag",        # free-form tag for seed/config distinction
+]
+
+
+@dataclass
+class RunRecord:
+    module: str
+    stage: str
+    best_score: float
+    avg_score: float
+    grade: str
+    minutes: float
+    updates: int = 0
+    episodes: int = 0
+    run_tag: str = ""
+    timestamp: Optional[datetime] = None
+
+    def to_row(self) -> Dict[str, str]:
+        ts = self.timestamp or datetime.now()
+        return {
+            "timestamp_iso": ts.isoformat(timespec="seconds"),
+            "date":          ts.strftime("%d-%m-%Y"),
+            "minutes":       f"{self.minutes:.1f}",
+            "module":        self.module,
+            "stage":          self.stage,
+            "best_score":    f"{self.best_score:.2f}",
+            "avg_score":     f"{self.avg_score:.2f}",
+            "grade":         self.grade,
+            "updates":       str(self.updates),
+            "episodes":      str(self.episodes),
+            "run_tag":       self.run_tag,
+        }
+
+
+class RunLogger:
+    """Append training/eval runs to a single CSV file.
+
+    Kept deliberately simple: one row per run, one file for the whole
+    project. The user wants to compare runs across days and configs.
+    """
+
+    def __init__(self, path: str = "models/runs.csv"):
+        self.path = path
+
+    def append(self, record: RunRecord) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        exists = os.path.isfile(self.path)
+        with open(self.path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS)
+            if not exists:
+                w.writeheader()
+            w.writerow(record.to_row())
+
+    def read_all(self) -> List[Dict[str, str]]:
+        if not os.path.isfile(self.path):
+            return []
+        with open(self.path, "r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+
+def score_to_universal_grade(score: float) -> str:
+    """Convenience: map a numeric score to a letter grade using the
+    universal thresholds (non-flycontrol modules AND as a live HUD
+    display during flycontrol training before a proper eval runs)."""
+    return _score_to_grade(score, _UNIVERSAL_THRESHOLDS)
+
+
+def score_to_flycontrol_grade(score: float) -> str:
+    return _score_to_grade(score, _FLYCONTROL_THRESHOLDS)

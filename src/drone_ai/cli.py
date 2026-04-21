@@ -7,13 +7,15 @@ import sys
 def main():
     parser = argparse.ArgumentParser(
         prog="drone-ai",
-        description="Autonomous drone AI — 4-layer architecture with tier-based grading"
+        description="Autonomous drone AI — 5-layer architecture with tier-based grading"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # train commands
     p_train = sub.add_parser("train", help="Train/benchmark an AI module")
-    p_train.add_argument("module", choices=["flycontrol", "pathfinder", "perception", "manager", "all"])
+    p_train.add_argument("module",
+                         choices=["flycontrol", "pathfinder", "perception",
+                                  "manager", "adaptive", "all"])
     p_train.add_argument("--population", type=int, default=6)
     p_train.add_argument("--ages", type=int, default=10)
     p_train.add_argument("--steps", type=int, default=10000)
@@ -80,6 +82,11 @@ def _run_train(args):
     if module in ("manager", "all"):
         from drone_ai.modules.manager.train import run_training as mg
         mg(args.grade, args.trials, "models/manager", args.seed, verbose)
+    if module == "adaptive":
+        # Adaptive requires a trained FlyControl model as its starting point.
+        # Defer to the module's own entry point for the richer CLI.
+        print("Use: py -m drone_ai.modules.adaptive.train --model <path> [opts]")
+        print("(the adaptive module is graded by improvement delta on OOD envs)")
 
 
 def _run_experiment(args):

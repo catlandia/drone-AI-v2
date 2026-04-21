@@ -7,11 +7,15 @@ a PPO update runs. Rewards and episode stats accumulate into the HUD.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
 
+from drone_ai.grading import (
+    RunLogger, RunRecord, score_to_flycontrol_grade,
+)
 from drone_ai.modules.flycontrol.agent import PPOAgent, PPOConfig
 from drone_ai.modules.flycontrol.environment import (
     FlyControlEnv, TaskType, OBS_DIM, ACT_DIM,
@@ -65,6 +69,8 @@ class TrainConfig:
     steps_per_update: int = 512
     total_updates: int = 1000
     save_path: Optional[str] = None
+    run_tag: str = ""                        # free-form tag for the run log
+    log_path: str = "models/runs.csv"
 
 
 class TrainerUI:
@@ -89,31 +95,60 @@ class TrainerUI:
         self.best_ep_reward = -float("inf")
         self.recent_rewards: List[float] = []
         self.latest_loss: Optional[float] = None
+        # Run-log bookkeeping: capture wall-clock so the log has minutes.
+        self._start_time = time.monotonic()
+        self._all_rewards: List[float] = []
 
     # ------------------------------------------------------------------
 
     def run(self) -> bool:
         running = True
-        while running and self.update_idx < self.cfg.total_updates:
-            running = self.renderer.handle_events(1 / 60)
-            if not running:
-                break
-            if not self.renderer.paused:
-                for _ in range(self.renderer.sim_speed):
-                    self._collect_step()
-                    if self.steps_since_update >= self.cfg.steps_per_update:
-                        self._do_update()
-                        break
-            self._render_frame()
-            self.renderer.flip()
+        try:
+            while running and self.update_idx < self.cfg.total_updates:
+                running = self.renderer.handle_events(1 / 60)
+                if not running:
+                    break
+                if not self.renderer.paused:
+                    for _ in range(self.renderer.sim_speed):
+                        self._collect_step()
+                        if self.steps_since_update >= self.cfg.steps_per_update:
+                            self._do_update()
+                            break
+                self._render_frame()
+                self.renderer.flip()
 
-        if self.cfg.save_path:
-            try:
-                self.agent.save(self.cfg.save_path)
-            except Exception as e:
-                print(f"[trainer] save failed: {e}")
-        self.renderer.close()
+            if self.cfg.save_path:
+                try:
+                    self.agent.save(self.cfg.save_path)
+                except Exception as e:
+                    print(f"[trainer] save failed: {e}")
+        finally:
+            # Always record the run, even if the user quit early — the
+            # minutes and best-score so far are still meaningful data points.
+            self._log_run()
+            self.renderer.close()
         return self.update_idx >= self.cfg.total_updates
+
+    def _log_run(self) -> None:
+        minutes = (time.monotonic() - self._start_time) / 60.0
+        avg = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
+        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
+        grade = score_to_flycontrol_grade(best)
+        rec = RunRecord(
+            module="flycontrol",
+            stage=self.cfg.stage,
+            best_score=best,
+            avg_score=avg,
+            grade=grade,
+            minutes=minutes,
+            updates=self.update_idx,
+            episodes=self.episode_idx,
+            run_tag=self.cfg.run_tag,
+        )
+        try:
+            RunLogger(self.cfg.log_path).append(rec)
+        except Exception as e:
+            print(f"[trainer] run-log append failed: {e}")
 
     # ------------------------------------------------------------------
 
@@ -130,6 +165,7 @@ class TrainerUI:
 
         if done:
             self.recent_rewards.append(self.ep_reward)
+            self._all_rewards.append(self.ep_reward)
             if len(self.recent_rewards) > 20:
                 self.recent_rewards.pop(0)
             if self.ep_reward > self.best_ep_reward:
@@ -152,6 +188,9 @@ class TrainerUI:
 
     def _render_frame(self):
         avg = (sum(self.recent_rewards) / len(self.recent_rewards)) if self.recent_rewards else 0.0
+        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
+        grade = score_to_flycontrol_grade(best) if self.best_ep_reward != -float("inf") else "—"
+        minutes = (time.monotonic() - self._start_time) / 60.0
         metrics = [
             ("update",  f"{self.update_idx}/{self.cfg.total_updates}", None),
             ("buffer",  f"{self.steps_since_update}/{self.cfg.steps_per_update}", None),
@@ -159,8 +198,10 @@ class TrainerUI:
             ("ep step", str(self.ep_len), None),
             ("ep R",    f"{self.ep_reward:+.1f}", None),
             ("avg R",   f"{avg:+.1f}", None),
-            ("best R",  f"{self.best_ep_reward:+.1f}"
+            ("best R",  f"{best:+.1f}"
                         if self.best_ep_reward != -float("inf") else "—", None),
+            ("grade",   grade, None),
+            ("time",    f"{minutes:.1f} min", None),
         ]
         if self.latest_loss is not None:
             metrics.append(("loss", f"{self.latest_loss:.3f}", None))
