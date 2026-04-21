@@ -138,11 +138,17 @@ class TrainerUI:
         return self.update_idx >= self.cfg.total_updates
 
     def _auto_save_path(self) -> str:
-        model_dir = os.path.dirname(self.cfg.log_path) or "models"
+        # Checkpoints live per-module: models/flycontrol/, models/perception/,
+        # etc. The run log sits at the top (models/runs.csv) and covers all
+        # modules, so we have to join in the module folder explicitly.
+        models_root = os.path.dirname(self.cfg.log_path) or "models"
+        module = "flycontrol"
+        module_dir = os.path.join(models_root, module)
+        os.makedirs(module_dir, exist_ok=True)
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
         grade = score_to_flycontrol_grade(best)
-        version = next_version(model_dir, "flycontrol")
-        return os.path.join(model_dir, generate_model_name(grade, "flycontrol", version))
+        version = next_version(module_dir, module)
+        return os.path.join(module_dir, generate_model_name(grade, module, version))
 
     def _log_run(self) -> None:
         minutes = (time.monotonic() - self._start_time) / 60.0
