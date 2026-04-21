@@ -107,7 +107,7 @@ class FlyControlEnv(gym.Env):
                 float(rng.uniform(-d * 10, d * 10)),
                 height,
             ], dtype=np.float32)
-            self._max_steps = 500
+            self._max_steps = 1500
 
         elif t == TaskType.DELIVERY:
             self.pickup = np.array([
@@ -120,7 +120,7 @@ class FlyControlEnv(gym.Env):
             ], dtype=np.float32)
             self.target = self.pickup.copy()
             self.target[2] = 5.0
-            self._max_steps = 1000
+            self._max_steps = 2500
 
         elif t in (TaskType.DELIVERY_ROUTE, TaskType.DEPLOYMENT):
             n_deliveries = int(2 + d * 4)
@@ -137,7 +137,7 @@ class FlyControlEnv(gym.Env):
                 self.waypoints.append(wp)
             self.waypoint_idx = 0
             self.target = self.waypoints[0].copy()
-            self._max_steps = 2000
+            self._max_steps = 4000
 
     def step(self, action: np.ndarray):
         state = self.physics.step(action)
@@ -165,9 +165,11 @@ class FlyControlEnv(gym.Env):
         reward = 0.0
         done = False
 
-        # Crash penalty
+        # Crash penalty — kept modest so a single hard landing doesn't
+        # dominate the gradient for the whole episode. Autonomy training
+        # needs the drone to dare to explore, not cower.
         if state.crashed:
-            return -100.0, True
+            return -20.0, True
 
         # Out-of-bounds soft penalty
         if not self.world.in_bounds(pos):

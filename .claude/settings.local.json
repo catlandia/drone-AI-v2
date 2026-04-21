@@ -19,7 +19,9 @@
       "Bash(py -m pip install pygame)",
       "Bash(py -m pip index versions pygame)",
       "Bash(py -m pip install pygame-ce)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(PYTHONPATH=src SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage hover --updates 1)",
+      "Bash(py -m pip install -e . --quiet)"
     ]
   }
 }

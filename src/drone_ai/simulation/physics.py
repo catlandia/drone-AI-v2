@@ -81,7 +81,9 @@ class QuadrotorPhysics:
     DT = 0.02                    # s (50 Hz)
     MAX_VEL = 28.0               # m/s clamp (real FPV can do 30+)
     MAX_ANG_VEL = 14.0           # rad/s clamp (real FPV can do 17+)
-    MAX_TILT = np.pi / 2.2       # ~82° — FPV can invert briefly in flips
+    # FPV drones can invert and recover — we DON'T crash on tilt alone.
+    # Only a hard ground impact or sustained total loss of control terminates.
+    HARD_IMPACT_VZ = 8.0         # m/s downward into ground = crash
 
     def __init__(self, dt: float = DT):
         self.dt = dt
@@ -161,18 +163,27 @@ class QuadrotorPhysics:
         y = self.state.orientation[2]
         self.state.orientation[2] = (y + np.pi) % (2 * np.pi) - np.pi
 
-        # 11. Ground collision.
+        # 11. Ground collision — only hard impacts crash. A real FPV drone
+        #     can touch down firmly without instantly breaking, and most
+        #     importantly an RL policy needs lots of near-ground exploration
+        #     during the learning phase without getting punished terminally.
         if self.state.position[2] < 0.0:
             self.state.position[2] = 0.0
-            if np.abs(self.state.velocity[2]) > 5.0:
+            if np.abs(self.state.velocity[2]) > self.HARD_IMPACT_VZ:
                 self.state.crashed = True
             else:
+                # Bounce/settle: kill vertical velocity, damp lateral.
                 self.state.velocity[2] = 0.0
+                self.state.velocity[0] *= 0.6
+                self.state.velocity[1] *= 0.6
 
-        # 12. Tilt crash (roll or pitch beyond MAX_TILT).
-        if (np.abs(self.state.orientation[0]) > self.MAX_TILT or
-                np.abs(self.state.orientation[1]) > self.MAX_TILT):
-            self.state.crashed = True
+        # Tilt-based crashes are intentionally OMITTED — FPV quads regularly
+        # invert during flips and recover. The drone will ultimately be
+        # punished (if at all) by hitting the ground, not by geometry.
+        # Wrap roll/pitch to (-π, π] to keep the representation bounded.
+        for i in (0, 1):
+            a = self.state.orientation[i]
+            self.state.orientation[i] = (a + np.pi) % (2 * np.pi) - np.pi
 
         # 13. Battery drain proportional to mean throttle.
         self.state.battery = max(0.0, self.state.battery - self.BATTERY_DRAIN * float(np.mean(m)))

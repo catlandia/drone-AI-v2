@@ -29,6 +29,13 @@ class PPOConfig:
 
 
 class ActorCritic(nn.Module):
+    # Target hover throttle for a 0.6 kg quad with 28 N max thrust:
+    #   T/W ≈ 4.75, so per-motor hover fraction ≈ 0.21.
+    # Bias the final actor layer so zero-weighted output lands at hover,
+    # giving PPO a sane starting distribution — otherwise the drone
+    # flails and crashes before collecting useful experience.
+    HOVER_THROTTLE = 0.21  # sigmoid(-1.33) ≈ 0.21
+
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 256):
         super().__init__()
         self.shared = nn.Sequential(
@@ -39,7 +46,15 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden, hidden // 2), nn.Tanh(),
             nn.Linear(hidden // 2, act_dim), nn.Sigmoid(),
         )
-        self.actor_log_std = nn.Parameter(torch.zeros(act_dim) - 0.5)
+        # Hover-bias the final linear layer: small weights + logit(hover) bias.
+        final = self.actor_mean[-2]  # the Linear before Sigmoid
+        nn.init.orthogonal_(final.weight, gain=0.01)
+        logit_hover = float(np.log(self.HOVER_THROTTLE / (1.0 - self.HOVER_THROTTLE)))
+        nn.init.constant_(final.bias, logit_hover)
+        # Lower initial exploration std — -0.5 gives σ≈0.61 (huge on [0,1]),
+        # -1.0 gives σ≈0.37 which is still plenty of exploration without
+        # making every motor command random noise in the first episodes.
+        self.actor_log_std = nn.Parameter(torch.zeros(act_dim) - 1.0)
         self.critic = nn.Sequential(
             nn.Linear(hidden, hidden // 2), nn.Tanh(),
             nn.Linear(hidden // 2, 1),
