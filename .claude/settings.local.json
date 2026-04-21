@@ -21,7 +21,9 @@
       "Bash(py -m pip install pygame-ce)",
       "Bash(git push *)",
       "Bash(PYTHONPATH=src SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage hover --updates 1)",
-      "Bash(py -m pip install -e . --quiet)"
+      "Bash(py -m pip install -e . --quiet)",
+      "Bash(py -c \"import pygame; print\\('pygame version:', pygame.version.ver\\); print\\('SDL:', pygame.version.SDL\\)\")",
+      "Bash(py -c \"import drone_ai; print\\(drone_ai.__file__\\)\")"
     ]
   }
 }

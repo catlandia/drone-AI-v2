@@ -13,8 +13,11 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+import os
+
 from drone_ai.grading import (
     RunLogger, RunRecord, score_to_flycontrol_grade,
+    generate_model_name, next_version,
 )
 from drone_ai.modules.flycontrol.agent import PPOAgent, PPOConfig
 from drone_ai.modules.flycontrol.environment import (
@@ -117,17 +120,29 @@ class TrainerUI:
                 self._render_frame()
                 self.renderer.flip()
 
-            if self.cfg.save_path:
-                try:
-                    self.agent.save(self.cfg.save_path)
-                except Exception as e:
-                    print(f"[trainer] save failed: {e}")
+            # Always persist the trained weights — previously the UI path
+            # left save_path=None so training runs vanished on exit. Name
+            # the file with the tier-list convention so runs.csv rows and
+            # disk checkpoints share a grade + date + version.
+            save_path = self.cfg.save_path or self._auto_save_path()
+            try:
+                self.agent.save(save_path)
+                print(f"[trainer] saved checkpoint -> {save_path}")
+            except Exception as e:
+                print(f"[trainer] save failed: {e}")
         finally:
             # Always record the run, even if the user quit early — the
             # minutes and best-score so far are still meaningful data points.
             self._log_run()
             self.renderer.close()
         return self.update_idx >= self.cfg.total_updates
+
+    def _auto_save_path(self) -> str:
+        model_dir = os.path.dirname(self.cfg.log_path) or "models"
+        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
+        grade = score_to_flycontrol_grade(best)
+        version = next_version(model_dir, "flycontrol")
+        return os.path.join(model_dir, generate_model_name(grade, "flycontrol", version))
 
     def _log_run(self) -> None:
         minutes = (time.monotonic() - self._start_time) / 60.0

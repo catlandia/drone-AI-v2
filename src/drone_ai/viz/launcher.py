@@ -336,6 +336,7 @@ def main():
     args = parser.parse_args()
 
     if args.stage:
+        exit_code = 0
         try:
             if args.stage == "demo":
                 _run_demo()
@@ -343,12 +344,13 @@ def main():
                 TrainerUI(TrainConfig(stage=args.stage, total_updates=args.updates)).run()
             else:
                 print(f"Unknown stage: {args.stage}", file=sys.stderr)
+                exit_code = 2
         finally:
             try:
                 pygame.quit()
             except Exception:
                 pass
-            sys.exit(2)
+            sys.exit(exit_code)
     else:
         Launcher().run()
 
