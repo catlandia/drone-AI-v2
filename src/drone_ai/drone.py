@@ -232,12 +232,15 @@ class DroneAI:
     def _compute_action(self, state: DroneState, target: np.ndarray) -> np.ndarray:
         # Build observation for the agent — MUST match FlyControlEnv._observe.
         # All slots are sensor-realistic (no GPS, no satellites).
-        from drone_ai.modules.flycontrol.environment import OBS_DIM
+        from drone_ai.modules.flycontrol.environment import OBS_DIM  # noqa: F401
         _, obs_dist = self.world.nearest_obstacle(state.position)
         # VIO-relative position: drone knows displacement from takeoff, not
         # absolute world coordinates. BASE is the mission's takeoff anchor.
         pos_vio = state.position - self.BASE
         rel = target - state.position
+        baro_alt = pos_vio[2]
+        braking = self.physics.braking_distance(state.velocity)
+        btemp_norm = float(np.clip((state.battery_temp - 25.0) / 30.0, -1.0, 1.0))
         obs = np.array([
             pos_vio[0] / 50.0,
             pos_vio[1] / 50.0,
@@ -245,6 +248,9 @@ class DroneAI:
             state.velocity[0] / 15.0,
             state.velocity[1] / 15.0,
             state.velocity[2] / 15.0,
+            state.acceleration[0] / 20.0,
+            state.acceleration[1] / 20.0,
+            state.acceleration[2] / 20.0,
             np.clip(state.orientation[0] / np.pi, -1, 1),
             np.clip(state.orientation[1] / np.pi, -1, 1),
             np.clip(state.orientation[2] / np.pi, -1, 1),
@@ -256,6 +262,9 @@ class DroneAI:
             rel[2] / 50.0,
             np.linalg.norm(rel) / 100.0,
             state.battery,
+            btemp_norm,
+            baro_alt / 50.0,
+            min(braking / 30.0, 1.0),
             min(obs_dist / 20.0, 1.0),
             0.0,
         ], dtype=np.float32)

@@ -4,21 +4,31 @@ All observations are restricted to what a FULLY OFFLINE drone could sense
 on its own — no GPS, no satellites, no cloud map data. Every slot below
 is annotated with the real sensor that would produce it in the field.
 
-Observation (19D):
+Observation (25D):
   [0:3]   position_vio   — displacement since takeoff (VIO: camera+IMU).
                             NOT absolute world XY. The drone does not know
                             where it is on Earth, only how far it has
                             drifted from the power-on point. Drifts slowly.
-  [3:6]   velocity       — body-linear velocity (VIO + IMU fusion).
-  [6:9]   orientation    — roll, pitch, yaw (IMU + magnetometer).
-  [9:12]  angular_velocity — gyro (IMU), very accurate.
-  [12:15] target_relative — (target - current_position). The target is
-                            a mission waypoint loaded from the flight plan
-                            BEFORE takeoff, expressed in the same VIO frame.
-  [15]    distance_to_target — derived, |target_relative|.
-  [16]    battery        — onboard battery monitor (voltage-derived).
-  [17]    nearest_obstacle_dist — camera/ToF depth, clipped at 20m.
-  [18]    carrying_package — internal state bit (cargo released or not).
+  [3:6]   velocity       — linear velocity (VIO + IMU fusion).
+  [6:9]   acceleration   — linear acceleration (IMU).  Added so the policy
+                            can feel "still decelerating, don't command
+                            full stop yet."
+  [9:12]  orientation    — roll, pitch, yaw (IMU + magnetometer).
+  [12:15] angular_velocity — gyro (IMU), very accurate.
+  [15:18] target_relative — (target - current_position). Target is a
+                            waypoint loaded from the flight plan BEFORE
+                            takeoff, expressed in the same VIO frame.
+  [18]    distance_to_target — derived, |target_relative|.
+  [19]    battery        — onboard battery monitor (voltage-derived SoC).
+  [20]    battery_temp   — battery temperature sensor, normalized.
+  [21]    barometer_alt  — altitude above takeoff (barometer, drifts
+                            on its own axis vs VIO z).
+  [22]    braking_dist   — current braking distance estimate from
+                            velocity — physics-layer helper so the policy
+                            (and upstream planners) can reason about
+                            inertia.
+  [23]    nearest_obstacle_dist — camera/ToF depth, clipped at 20m.
+  [24]    carrying_package — internal state bit (cargo released or not).
 
 Action (4D): motor commands [0, 1]
 """
@@ -40,7 +50,7 @@ class TaskType(Enum):
     DEPLOYMENT = "deployment"
 
 
-OBS_DIM = 19
+OBS_DIM = 25
 ACT_DIM = 4
 
 
@@ -98,6 +108,17 @@ class FlyControlEnv(gym.Env):
         if self.domain_rand:
             self.physics.MASS = float(self._rng.uniform(0.4, 0.6))
             self.physics.G = float(self._rng.uniform(9.5, 10.1))
+            # Realistic-ish outdoor wind + gust budget so deployment-stage
+            # policies learn to hold station against it.
+            wind_mean = self._rng.uniform(-4.0, 4.0, size=3).astype(np.float32)
+            wind_mean[2] *= 0.25  # vertical gusts are smaller than horizontal
+            gust_std = float(self._rng.uniform(0.0, 1.5))
+            self.physics.set_wind(wind_mean, gust_std=gust_std)
+            # Small probability of prop wear / failure at deployment.
+            self.physics.set_wear(True, rate=1e-7, failure_prob=1e-7)
+        else:
+            self.physics.set_wind(np.zeros(3), gust_std=0.0)
+            self.physics.set_wear(False)
 
         start = self._rng.uniform([-5, -5, 2], [5, 5, 8]).astype(np.float32)
         self.physics.reset(position=start)
@@ -236,7 +257,11 @@ class FlyControlEnv(gym.Env):
         # VIO-relative position: the drone only knows how far it has moved
         # since takeoff, not its absolute world coordinates. NO GPS.
         pos_vio = s.position - self._start_position
-        rel = self.target - s.position  # target was set in sim world = VIO world
+        rel = self.target - s.position
+        baro_alt = pos_vio[2]  # treated as baro here; noise injection later
+        braking = self.physics.braking_distance(s.velocity)
+        # Battery temp normalized around 25 °C reference, ±30 °C swing.
+        btemp_norm = np.clip((s.battery_temp - 25.0) / 30.0, -1.0, 1.0)
         obs = np.array([
             pos_vio[0] / 50.0,
             pos_vio[1] / 50.0,
@@ -244,6 +269,9 @@ class FlyControlEnv(gym.Env):
             s.velocity[0] / 15.0,
             s.velocity[1] / 15.0,
             s.velocity[2] / 15.0,
+            s.acceleration[0] / 20.0,
+            s.acceleration[1] / 20.0,
+            s.acceleration[2] / 20.0,
             np.clip(s.orientation[0] / np.pi, -1, 1),
             np.clip(s.orientation[1] / np.pi, -1, 1),
             np.clip(s.orientation[2] / np.pi, -1, 1),
@@ -255,6 +283,9 @@ class FlyControlEnv(gym.Env):
             rel[2] / 50.0,
             np.linalg.norm(rel) / 100.0,
             s.battery,
+            btemp_norm,
+            baro_alt / 50.0,
+            min(braking / 30.0, 1.0),
             min(obs_dist / 20.0, 1.0),
             float(self.carrying),
         ], dtype=np.float32)

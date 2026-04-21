@@ -109,26 +109,26 @@ Every slot is annotated with its source sensor — the drone must be
 able to produce this data **without GPS, without cloud, without
 absolute world coordinates**. See [`sensors.md`](sensors.md).
 
-Current 19-dim vector (normalized to `[-1, 1]`):
+Current 25-dim vector (normalized to `[-1, 1]`):
 
 ```
-[0:3]   IMU+VIO     displacement from takeoff   / 50 m
-[3:6]   IMU         velocity                     / 15 m/s
-[6:9]   IMU         orientation (roll,pitch,yaw)/ π
-[9:12]  IMU         angular velocity             / 6 rad/s
-[12:15] internal    target - displacement        / 50 m (from mission)
-[15]    internal    distance to target           / 100 m
-[16]    battery     state-of-charge ∈ [0, 1]
-[17]    camera/ToF  nearest-obstacle distance    / 20 m
-[18]    internal    carrying_package ∈ {0, 1}
+[0:3]    IMU+VIO     displacement from takeoff   / 50 m
+[3:6]    IMU         velocity                     / 15 m/s
+[6:9]    IMU         linear acceleration          / 20 m/s²
+[9:12]   IMU+mag     orientation (roll,pitch,yaw)/ π
+[12:15]  IMU         angular velocity             / 6 rad/s
+[15:18]  internal    target − displacement        / 50 m
+[18]     internal    distance to target           / 100 m
+[19]     battery     state-of-charge ∈ [0, 1]
+[20]     battery     temperature (normalized ±30 °C around 25 °C ref)
+[21]     barometer   altitude above takeoff       / 50 m
+[22]     physics     braking distance estimate    / 30 m
+[23]     camera/ToF  nearest-obstacle distance    / 20 m
+[24]     internal    carrying_package ∈ {0, 1}
 ```
 
-Planned additions:
-- Barometer altitude above takeoff (separate from VIO z).
-- Battery temperature.
-- Finite-differenced acceleration (so the policy can feel "still
-  decelerating").
-- Braking-distance estimate (exposed to Pathfinder + Manager).
+Next planned: sensor noise injection (IMU bias, VIO drift, baro
+drift) so training matches sim-to-real expectations more tightly.
 
 ## Grading and run log
 
@@ -147,10 +147,12 @@ src/drone_ai/
 │   ├── flycontrol/          # PPO motor control (Layer 4)
 │   ├── pathfinder/          # A*/RRT planning (Layer 2)
 │   ├── perception/          # Detection + tracking (Layer 3)
-│   │   ├── obstacles/       # Phase 1: to split
-│   │   ├── hazards/
-│   │   ├── targets/
-│   │   └── agents/
+│   │   ├── obstacles.py     # generic obstacles (landed)
+│   │   ├── hazards.py       # people/animals/vehicles/powerlines/water
+│   │   ├── targets.py       # landing pads, drop markers
+│   │   ├── agents.py        # other drones (for Layer 8)
+│   │   ├── detector.py      # shared noise model + Detection dataclass
+│   │   └── tracker.py       # Kalman tracker
 │   ├── manager/             # Mission planning (Layer 1)
 │   └── adaptive/            # Layer 5 — Phase 2 design locked
 ├── viz/

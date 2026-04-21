@@ -145,6 +145,15 @@ class PathPlanner:
         self.astar = AStarPlanner(world, grid_resolution)
         self.rrt = RRTPlanner(world)
         self._rng = np.random.default_rng()
+        # Physics-layer pushes the current braking distance here; if
+        # any planned path corner would require a tighter stop than the
+        # drone can physically make, the planner inflates the obstacle
+        # margin on that segment. See docs/physics_realism.md for why
+        # inertia is a first-class planning input.
+        self._braking_distance = 0.0
+
+    def set_braking_distance(self, metres: float) -> None:
+        self._braking_distance = max(0.0, float(metres))
 
     def plan(self, start: np.ndarray, goal: np.ndarray) -> List[np.ndarray]:
         """Plan path from start to goal. Returns waypoints including start and goal."""
