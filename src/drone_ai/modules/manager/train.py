@@ -114,6 +114,7 @@ def run_training(
     save_dir: str = "models/manager",
     seed: int = 42,
     verbose: bool = True,
+    run_tag: str = "",
 ) -> Tuple[str, float]:
     if verbose:
         print(f"\n{'='*60}")
@@ -148,7 +149,7 @@ def run_training(
         RunLogger().append(RunRecord(
             module="manager", stage="benchmark",
             best_score=score, avg_score=score, grade=measured_grade,
-            minutes=0.0, episodes=trials,
+            minutes=0.0, episodes=trials, run_tag=run_tag,
         ))
     except Exception as e:
         print(f"[manager] run-log append failed: {e}")

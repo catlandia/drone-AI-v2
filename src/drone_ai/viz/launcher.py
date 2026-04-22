@@ -216,42 +216,52 @@ def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> 
     thread and write to stdout. The launcher wraps non-FlyControl
     calls in a worker thread + redirected stdout so the launcher
     window can render a progress panel concurrently.
+
+    A missing `base_path` means the user picked "(fresh)" in the
+    picker. We propagate that as `run_tag="test"` so runs.csv rows
+    coming out of a fresh launch are distinguishable from real
+    curriculum steps — useful when the chain is empty and the user
+    just wants to exercise the training machinery.
     """
+    is_test = base_path is None
+    tag = "test" if is_test else ""
+
     if card.section == "flycontrol":
         cfg = TrainConfig(
             stage=card.key,
             total_updates=total_updates,
             warm_start_path=base_path,
             hold_on_finish=True,
+            test_run=is_test,
+            run_tag=tag,
         )
         TrainerUI(cfg).run()
         return
 
     if card.key == "manager":
         from drone_ai.modules.manager.train import run_training
-        run_training(grade="P", trials=20, save_dir="models/manager")
+        run_training(grade="P", trials=20, save_dir="models/manager", run_tag=tag)
     elif card.key == "pathfinder":
         from drone_ai.modules.pathfinder.train import run_training
-        run_training(trials=30, save_dir="models/pathfinder")
+        run_training(trials=30, save_dir="models/pathfinder", run_tag=tag)
     elif card.key == "perception":
         from drone_ai.modules.perception.train import run_training, run_submodels
-        run_training(grade="P", trials=80, save_dir="models/perception")
+        run_training(grade="P", trials=80, save_dir="models/perception", run_tag=tag)
         run_submodels(grade="P", trials=40, save_dir="models/perception")
     elif card.key == "adaptive":
         from drone_ai.modules.adaptive.train import run_training
-        run_training(model_path=base_path, episodes=3, save_dir="models/adaptive")
+        run_training(model_path=base_path, episodes=3, save_dir="models/adaptive", run_tag=tag)
     elif card.key == "storage":
         from drone_ai.modules.storage.train import run_training
-        run_training(n_missions=20, save_dir="models/storage")
+        run_training(n_missions=20, save_dir="models/storage", run_tag=tag)
     elif card.key == "personality":
         from drone_ai.modules.personality.train import run_training
         # The personality benchmark looks up the newest checkpoint
-        # internally; we pass nothing — the picker is informational
-        # for this card. (Future: wire base_path through.)
-        run_training(save_dir="models/personality")
+        # internally; base_path is informational for this card.
+        run_training(save_dir="models/personality", run_tag=tag)
     elif card.key == "swarm":
         from drone_ai.modules.swarm.train import run_training
-        run_training(trials=30, n_drones=4, save_dir="models/swarm")
+        run_training(trials=30, n_drones=4, save_dir="models/swarm", run_tag=tag)
     elif card.key == "demo":
         _run_demo(base_path)
     else:
@@ -483,6 +493,7 @@ class Launcher:
             # FlyControl stages open their own window; we don't run
             # them in a worker thread. Tear down the launcher window
             # while the trainer owns the display, then come back.
+            is_test = path is None
             pygame.display.quit()
             try:
                 cfg = TrainConfig(
@@ -490,6 +501,8 @@ class Launcher:
                     total_updates=self.total_updates,
                     warm_start_path=path,
                     hold_on_finish=True,
+                    test_run=is_test,
+                    run_tag="test" if is_test else "",
                 )
                 TrainerUI(cfg).run()
             except Exception as e:
@@ -524,6 +537,7 @@ class Launcher:
         elapsed = time.monotonic() - self._run_t0
         card = self._results_card
         rows = _load_recent_runs(limit=12)
+        is_test = self._worker is not None and self._worker.base_path is None
         # Find the most recent row that matches this card's module.
         latest = None
         if card is not None:
@@ -534,9 +548,13 @@ class Launcher:
                     break
         lines: List[Tuple[str, str]] = []
         title = card.title if card is not None else "Run"
-        lines.append((title, "title"))
+        lines.append((f"TEST TRAINING — {title}" if is_test else title, "title"))
         if card is not None:
             lines.append((card.subtitle, "dim"))
+        if is_test:
+            lines.append(
+                ("no base model — results are a training-machinery check", "warn")
+            )
         lines.append(("", "dim"))
         if self._worker is not None and self._worker.error:
             lines.append((f"FAILED: {self._worker.error}", "warn"))
@@ -545,10 +563,13 @@ class Launcher:
             best = latest.get("best_score", "—")
             avg = latest.get("avg_score", "—")
             stage = latest.get("stage", "—")
+            tag = latest.get("run_tag", "")
             lines.append((f"Grade: {grade}", "accent"))
             lines.append((f"Best score: {best}", "text"))
             lines.append((f"Avg score:  {avg}", "text"))
             lines.append((f"Stage:      {stage}", "text"))
+            if tag:
+                lines.append((f"Tag:        {tag}", "dim"))
         else:
             lines.append(("(no runs.csv row found for this card)", "warn"))
         lines.append((f"Elapsed:    {elapsed:.1f}s", "text"))
@@ -762,11 +783,29 @@ class Launcher:
             return
         rect = self._modal_rect(820, 580)
         self._draw_modal_bg(rect, accent=card.accent)
-        t = self.font_xl.render(f"Launch — {card.title}", True, TEXT_TITLE)
+        # Current selection — if "(fresh)" is highlighted we call the
+        # run a TEST TRAINING up front so the user knows what they'll
+        # get before hitting Enter.
+        _, current_path = (
+            self._picker_options[self._picker_idx]
+            if self._picker_options else (None, None)
+        )
+        is_test = current_path is None
+        title_text = (
+            f"Test Training — {card.title}" if is_test else f"Launch — {card.title}"
+        )
+        t = self.font_xl.render(title_text, True, TEXT_WARN if is_test else TEXT_TITLE)
         self.screen.blit(t, (rect.x + 24, rect.y + 18))
         sub = self.font_md.render(card.subtitle, True, TEXT_ACCENT)
         self.screen.blit(sub, (rect.x + 24, rect.y + 58))
-        if card.base_hint:
+        if is_test:
+            note = self.font_sm.render(
+                "No base model selected — run exercises the training "
+                "machinery and is tagged 'test' in runs.csv.",
+                True, TEXT_WARN,
+            )
+            self.screen.blit(note, (rect.x + 24, rect.y + 80))
+        elif card.base_hint:
             h = self.font_sm.render(card.base_hint, True, TEXT_DIM)
             self.screen.blit(h, (rect.x + 24, rect.y + 80))
 
@@ -811,7 +850,11 @@ class Launcher:
             return
         rect = self._modal_rect(820, 580)
         self._draw_modal_bg(rect, accent=card.accent)
-        t = self.font_xl.render(f"Running — {card.title}", True, TEXT_TITLE)
+        is_test = self._worker is not None and self._worker.base_path is None
+        title_text = (
+            f"Running Test — {card.title}" if is_test else f"Running — {card.title}"
+        )
+        t = self.font_xl.render(title_text, True, TEXT_WARN if is_test else TEXT_TITLE)
         self.screen.blit(t, (rect.x + 24, rect.y + 18))
         elapsed = time.monotonic() - self._run_t0
         spin = ".." + "." * (int(elapsed * 4) % 4)

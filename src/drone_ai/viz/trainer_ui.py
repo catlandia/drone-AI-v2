@@ -140,6 +140,13 @@ class TrainConfig:
     # open on a results screen until the user dismisses it. The launcher
     # turns this on so missions don't auto-exit the moment they finish.
     hold_on_finish: bool = True
+    # If True, the run is labeled "TEST TRAINING" everywhere the user
+    # sees it — HUD title, results screen, runs.csv run_tag. The launcher
+    # sets this when the user picked "(fresh)" in the pre-launch picker,
+    # so a run without a real baseline can be recognized at a glance
+    # (useful when the curriculum chain is still empty and you just want
+    # to exercise the training machinery).
+    test_run: bool = False
 
 
 class TrainerUI:
@@ -169,7 +176,8 @@ class TrainerUI:
                 print(f"[trainer] warm-started {cfg.stage} from {warm}")
             except Exception as e:
                 print(f"[trainer] warm-start skipped ({warm}): {e}")
-        self.renderer = Renderer(title=f"Training — {self.stage_def['title']}")
+        prefix = "Test Training" if cfg.test_run else "Training"
+        self.renderer = Renderer(title=f"{prefix} — {self.stage_def['title']}")
 
         self.obs, _ = self.env.reset(seed=cfg.seed)
         self.ep_reward = 0.0
@@ -242,9 +250,16 @@ class TrainerUI:
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
         grade = score_to_flycontrol_grade(best) if self.best_ep_reward != -float("inf") else "—"
         minutes = (time.monotonic() - self._start_time) / 60.0
+        is_test = self.cfg.test_run or not self.base_model_name
+        title = (
+            f"TEST TRAINING — {self.stage_def['title']}"
+            if is_test else f"FlyControl — {self.stage_def['title']}"
+        )
         results_lines = [
-            ("FlyControl — " + self.stage_def["title"], "title"),
-            (f"Stage: {self.cfg.stage}", "dim"),
+            (title, "title"),
+            (f"Stage: {self.cfg.stage}" +
+             ("   ·   no base model — results are a training-machinery check" if is_test else ""),
+             "dim"),
             ("", "dim"),
             (f"Grade:    {grade}  ({GRADE_NAMES.get(grade,'')})", "accent"),
             (f"Best R:   {best:+.1f}", "text"),
@@ -289,6 +304,13 @@ class TrainerUI:
         avg = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
         grade = score_to_flycontrol_grade(best)
+        # A fresh-base run (test_run or no base_model_name) is tagged
+        # "test" so the runs.csv reader can filter it out when comparing
+        # real curriculum steps.
+        is_test = self.cfg.test_run or not self.base_model_name
+        tag = self.cfg.run_tag or ""
+        if is_test and "test" not in tag.split(","):
+            tag = f"{tag},test".lstrip(",")
         rec = RunRecord(
             module="flycontrol",
             stage=self.cfg.stage,
@@ -298,7 +320,7 @@ class TrainerUI:
             minutes=minutes,
             updates=self.update_idx,
             episodes=self.episode_idx,
-            run_tag=self.cfg.run_tag,
+            run_tag=tag,
         )
         try:
             RunLogger(self.cfg.log_path).append(rec)
@@ -365,9 +387,12 @@ class TrainerUI:
         if self.base_model_name:
             subtitle = f"{subtitle}   •   base: {self.base_model_name}"
         else:
-            subtitle = f"{subtitle}   •   base: fresh"
+            # No base — label as a test run so the user can tell at a
+            # glance this isn't a real curriculum step.
+            subtitle = f"{subtitle}   •   base: fresh (TEST)"
+        title_prefix = "TEST TRAINING" if (self.cfg.test_run or not self.base_model_name) else "TRAINING"
         hud = {
-            "title":    f"TRAINING — {self.stage_def['title']}",
+            "title":    f"{title_prefix} — {self.stage_def['title']}",
             "subtitle": subtitle,
             "metrics":  metrics,
         }
