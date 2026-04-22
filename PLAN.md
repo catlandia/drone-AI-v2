@@ -435,13 +435,40 @@ failures do not trigger rollback (too sensitive to wind / noise).
 
 - ~~Fix pygame exit / file-reload bug~~ **DONE** (auto-save added,
   sys.exit code fixed).
-- Phase 1 physics upgrades (inertia tensor, gyro, drag, wind,
-  ground effect, prop wear, battery temp).
-- Perception split into sub-models (Obstacles/Hazards/Targets/Agents).
-- **BC warm-up** — use the onboard PD controller as an imitation
-  signal for the PPO actor before PPO takes over.
+- ~~Phase 1 physics upgrades~~ **DONE** (inertia tensor, gyro, drag,
+  wind, ground effect, prop wear, battery temp, braking distance,
+  linear acceleration in obs).
+- ~~Perception split into sub-models~~ **DONE** (Obstacles/Hazards/
+  Targets/Agents — Obstacles uses the noise model, the other three
+  are Phase-1 stubs awaiting the CNN + world-annotation upgrade).
+- ~~**BC warm-up**~~ **DONE** (`modules/flycontrol/pd_controller.py`
+  + `PPOAgent.bc_warmup`; TrainerUI auto-enables on fresh launches;
+  post-BC `log_std` clamped to −2.2).
+- ~~Wider hover reward gradient~~ **DONE** (faint 20 m linear on top
+  of the steep on-target bonus so PPO gets signal during approach).
 - Sensor noise injection — IMU bias, VIO drift, baro drift.
 - Full curriculum run across Layers 1-4, producing graded checkpoints.
+
+## 18a. Phase 2 implementation status
+
+Originally gated on Phase 1.5, but all four Phase 2 layers now have
+code + a launcher benchmark so the UI covers every layer.
+
+- **Layer 5 — Adaptive.** `AdaptiveLearner` with frozen `Warden`,
+  20-episode `RollbackMonitor`, and `SoftBoundRegistry` (N = 50
+  recoveries required before a soft bound may be softened). Mid-
+  flight updates restricted to FlyControl; landed-only for the rest.
+- **Layer 6 — Storage of Learnings.** Append-only per-drone JSONL at
+  `logs/storage/drone_{id}.jsonl` with `UpdateRecord` + `MissionRecord`
+  rows. Wired into `DroneAI` so missions auto-log outcomes.
+- **Layer 7 — Personality.** Transferable delta artifact;
+  `export_personality` / `apply_personality`; manual
+  `select_best_drone` ranker.
+- **Layer 8 — Swarm Cooperation.** `SwarmPlan` + `SwarmCoordinator`
+  with visual mutual avoidance via Perception-Agents, LIFE_CRITICAL-
+  exempt swarm-mate-failed contingency, zero post-takeoff radio.
+
+Real field deployment still waits on Phase 1.5.
 
 ## 19. Open tunables (Phase 2)
 
@@ -472,7 +499,9 @@ Proposed defaults; Layer 5 can tune later.
 
 ## 21. Out of scope (for now)
 
-- Layer 5-8 implementation (Phase 2).
 - Cross-drone runtime sync protocol details.
 - Station-side best-drone identification implementation (QR +
   memory-drive read — deferred).
+- CNN-backed Perception sub-models (Phase 1.5 hardware work).
+- Mid-flight Layer-5 updates on non-FlyControl layers (still
+  landed-only by design).

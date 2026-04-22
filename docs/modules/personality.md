@@ -1,6 +1,9 @@
 # Personality — Layer 7
 
-**Phase 2. Design locked, not implemented.**
+**Phase 2. In code:** `src/drone_ai/modules/personality/artifact.py`.
+Benchmarked from the launcher's "Personality" card (applies the
+exported delta to noisy sibling baselines and measures recovery
+residual).
 
 Transferable artifact encapsulating a drone's learned personality —
 the weight + hyperparameter subset that made it good.

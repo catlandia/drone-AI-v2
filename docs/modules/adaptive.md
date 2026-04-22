@@ -1,6 +1,8 @@
 # Adaptive — Layer 5
 
-**Phase 2. Design locked, not implemented.**
+**Phase 2. In code:** `src/drone_ai/modules/adaptive/`
+(`learner.py`, `warden.py`, `rollback.py`, `soft_bounds.py`).
+Benchmarked from the launcher's "Adaptive" card.
 
 Online learning of every other layer, and of itself. Every update
 is guarded.

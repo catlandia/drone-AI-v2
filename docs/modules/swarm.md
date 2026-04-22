@@ -1,6 +1,8 @@
 # Swarm Cooperation — Layer 8
 
-**Phase 2. Design locked, not implemented.**
+**Phase 2. In code:** `src/drone_ai/modules/swarm/`
+(`plan.py`, `coordinator.py`). Benchmarked from the launcher's
+"Swarm" card against a hand-written right-of-way spec.
 
 Multi-drone coordination with **zero radio comms after takeoff**.
 

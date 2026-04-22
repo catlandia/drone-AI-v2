@@ -1,6 +1,8 @@
 # Storage of Learnings — Layer 6
 
-**Phase 2. Design locked, not implemented.**
+**Phase 2. In code:** `src/drone_ai/modules/storage/log.py`.
+Benchmarked from the launcher's "Storage" card (writes synthetic
+rows, stress-tests tail-truncation + malformed-JSON tolerance).
 
 Per-drone persistent log of everything Layer 5 learned during flight.
 
