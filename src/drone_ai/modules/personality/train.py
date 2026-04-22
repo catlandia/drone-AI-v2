@@ -1,16 +1,25 @@
-"""Personality benchmark — auto-export from the latest FlyControl checkpoint.
+"""Personality benchmark — test delta transfer across noisy baselines.
 
-Personalities are deltas. To exercise the export+apply round-trip
-without an existing proven drone, we:
-  1. Find the latest FlyControl checkpoint on disk (any stage).
-  2. Build a "proven" copy by mutating it slightly.
-  3. Export the personality (proven - baseline).
-  4. Apply it to a fresh baseline copy.
-  5. Score the round-trip on weight-difference recovery: how close
-     does (baseline + delta) get to the proven weights?
+A Personality is only useful if its delta carries the "personality"
+(the Layer-5-learned bits) in a way that survives being applied to a
+different-but-related drone. The trivial case — apply the exact
+delta to the exact source baseline — always reconstructs perfectly
+and tells us nothing.
 
-Writes a graded `.pt` placeholder under models/personality/ and
-appends a row to models/runs.csv tagged module=personality.
+This benchmark:
+  1. Pick a baseline (auto-discover the newest FlyControl checkpoint;
+     fall back to a fresh PPOAgent).
+  2. Build a "proven" drone by mutating the baseline.
+  3. Export the delta.
+  4. For each of several NOISY sibling baselines (baseline + small
+     Gaussian noise), apply the delta and measure how close the
+     result is to the proven target.
+  5. Score on the average recovery across those noisy siblings.
+
+A correct implementation scores high (~800) when the delta transfer
+works well; a broken one (wrong parameter shapes, silently dropped
+tensors, etc.) scores much lower because noisy siblings aren't
+exactly the baseline and the delta alone can't paper over that.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,7 +47,6 @@ from drone_ai.modules.personality import (
 
 
 def _newest_flycontrol_checkpoint(models_root: str = "models") -> Optional[str]:
-    """Walk models/flycontrol/<stage>/ and return the newest .pt."""
     fc_root = os.path.join(models_root, "flycontrol")
     if not os.path.isdir(fc_root):
         return None
@@ -58,19 +66,42 @@ def _newest_flycontrol_checkpoint(models_root: str = "models") -> Optional[str]:
     return candidates[0][2]
 
 
+def _mutate(agent: PPOAgent, noise_std: float, rng: np.random.Generator) -> PPOAgent:
+    child = agent.clone()
+    g = torch.Generator()
+    g.manual_seed(int(rng.integers(0, 2**31)))
+    with torch.no_grad():
+        for p in child.policy.parameters():
+            p.add_(torch.randn(p.shape, generator=g) * noise_std)
+    return child
+
+
+def _recovery_residual(proven: PPOAgent, target: PPOAgent, baseline: PPOAgent) -> float:
+    proven_state = proven.policy.state_dict()
+    base_state = baseline.policy.state_dict()
+    target_state = target.policy.state_dict()
+    num = 0.0
+    denom = 0.0
+    for k in proven_state:
+        num += float(torch.linalg.vector_norm(proven_state[k] - target_state[k]) ** 2)
+        denom += float(torch.linalg.vector_norm(proven_state[k] - base_state[k]) ** 2)
+    return (num / max(denom, 1e-12)) ** 0.5
+
+
 def benchmark(
     seed: int = 42,
     verbose: bool = True,
     out_artifact: Optional[str] = None,
     models_root: str = "models",
+    n_siblings: int = 5,
+    sibling_noise: float = 0.02,
+    proven_noise: float = 0.04,
 ) -> Tuple[str, float, dict]:
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
     baseline_path = _newest_flycontrol_checkpoint(models_root)
     if baseline_path is None:
-        # No flycontrol checkpoints yet — build a fresh baseline so we
-        # can still exercise the round-trip.
         baseline = PPOAgent(OBS_DIM, ACT_DIM, PPOConfig())
         baseline_name = "fresh_init"
         if verbose:
@@ -81,12 +112,8 @@ def benchmark(
         if verbose:
             print(f"  Baseline: {baseline_path}")
 
-    # "Proven" = baseline + small noise. In real life this would be
-    # the post-Layer-5 fine-tuned weights.
-    proven = baseline.clone()
-    with torch.no_grad():
-        for p in proven.policy.parameters():
-            p.add_(torch.randn_like(p) * 0.02)
+    # Proven drone: baseline + stronger noise (the "personality").
+    proven = _mutate(baseline, proven_noise, rng)
 
     # Export.
     personality = export_personality(
@@ -96,33 +123,40 @@ def benchmark(
         confidence=0.6,
     )
 
-    # Apply to a fresh copy of baseline.
-    target = baseline.clone()
-    applied_names = apply_personality(target, personality)
+    # Apply to N noisy siblings. Residual is measured against proven
+    # because that's the drone we're trying to replicate.
+    residuals: List[float] = []
+    for i in range(n_siblings):
+        sibling = _mutate(baseline, sibling_noise, rng)
+        target = sibling.clone()
+        apply_personality(target, personality)
+        residuals.append(_recovery_residual(proven, target, baseline))
 
-    # Round-trip metric: ‖proven - target‖ / ‖proven - baseline‖.
-    # 0 = perfect recovery (target == proven). 1.0 = no recovery
-    # (target == baseline). Anything below 1e-3 is essentially exact.
-    proven_state = proven.policy.state_dict()
-    base_state = baseline.policy.state_dict()
-    target_state = target.policy.state_dict()
+    # Also record the trivial residual — apply to the exact baseline.
+    # A correct delta drives this to ~0 (sanity check, not the grade).
+    trivial = baseline.clone()
+    apply_personality(trivial, personality)
+    trivial_residual = _recovery_residual(proven, trivial, baseline)
 
-    num = 0.0
-    denom = 0.0
-    for k in proven_state:
-        num += float(torch.linalg.vector_norm(proven_state[k] - target_state[k]) ** 2)
-        denom += float(torch.linalg.vector_norm(proven_state[k] - base_state[k]) ** 2)
-    recovery_residual = (num / max(denom, 1e-12)) ** 0.5
+    mean_res = float(np.mean(residuals))
+    max_res = float(np.max(residuals))
 
-    # Score: 0 residual → max score; 1.0 residual → 0 score.
-    score = max(0.0, (1.0 - recovery_residual)) * 800.0
+    # Score: residual of 0 → full marks, residual of 1 → 0 marks,
+    # blended between mean and worst-case so a single noisy sibling
+    # can't sink the grade.
+    effective = 0.7 * mean_res + 0.3 * max_res
+    score = max(0.0, min(1.0, 1.0 - effective)) * 800.0
     grade = score_to_universal_grade(score)
 
     metrics = {
         "baseline": baseline_name,
-        "applied_tensors": len(applied_names),
-        "total_delta_tensors": len(personality.weight_deltas),
-        "recovery_residual": recovery_residual,
+        "n_siblings": n_siblings,
+        "sibling_noise": sibling_noise,
+        "proven_noise": proven_noise,
+        "mean_residual": mean_res,
+        "max_residual": max_res,
+        "trivial_residual": trivial_residual,
+        "applied_tensors": len(personality.weight_deltas),
         "score": score,
         "grade": grade,
     }
@@ -132,8 +166,9 @@ def benchmark(
         metrics["artifact_path"] = out_artifact
 
     if verbose:
-        print(f"  Tensors applied: {len(applied_names)}/{len(personality.weight_deltas)}")
-        print(f"  Recovery residual: {recovery_residual:.2e} (lower is better)")
+        print(f"  Tensors in artifact: {len(personality.weight_deltas)}")
+        print(f"  Trivial residual:   {trivial_residual:.3e}  (same baseline)")
+        print(f"  Sibling residual:   mean={mean_res:.3f} max={max_res:.3f}")
         print(f"  Score: {score:.1f}  Grade: {grade}")
         if out_artifact:
             print(f"  Wrote artifact: {out_artifact}")
@@ -167,7 +202,7 @@ def run_training(
 
     try:
         RunLogger(log_path).append(RunRecord(
-            module="personality", stage="export_round_trip",
+            module="personality", stage="sibling_transfer",
             best_score=score, avg_score=score, grade=grade,
             minutes=0.0, episodes=1, run_tag=run_tag,
         ))

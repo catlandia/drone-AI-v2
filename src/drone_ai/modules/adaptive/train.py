@@ -130,7 +130,7 @@ def _newest_flycontrol_checkpoint(models_root: str = "models") -> Optional[str]:
 def run_training(
     model_path: Optional[str] = None,
     task: TaskType = TaskType.HOVER,
-    episodes: int = 5,
+    episodes: int = 15,
     save_dir: str = "models/adaptive",
     seed: int = 42,
     verbose: bool = True,

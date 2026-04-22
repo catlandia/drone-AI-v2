@@ -250,10 +250,10 @@ def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> 
         run_submodels(grade="P", trials=40, save_dir="models/perception")
     elif card.key == "adaptive":
         from drone_ai.modules.adaptive.train import run_training
-        run_training(model_path=base_path, episodes=3, save_dir="models/adaptive", run_tag=tag)
+        run_training(model_path=base_path, episodes=15, save_dir="models/adaptive", run_tag=tag)
     elif card.key == "storage":
         from drone_ai.modules.storage.train import run_training
-        run_training(n_missions=20, save_dir="models/storage", run_tag=tag)
+        run_training(n_missions=60, save_dir="models/storage", run_tag=tag)
     elif card.key == "personality":
         from drone_ai.modules.personality.train import run_training
         # The personality benchmark looks up the newest checkpoint
@@ -261,7 +261,7 @@ def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> 
         run_training(save_dir="models/personality", run_tag=tag)
     elif card.key == "swarm":
         from drone_ai.modules.swarm.train import run_training
-        run_training(trials=30, n_drones=4, save_dir="models/swarm", run_tag=tag)
+        run_training(trials=800, n_drones=4, save_dir="models/swarm", run_tag=tag)
     elif card.key == "demo":
         _run_demo(base_path)
     else:
