@@ -12,7 +12,7 @@
 
 `FlyControlEnv` implements `gymnasium.Env`:
 
-- **Observation:** 19D vector (see [architecture.md](../architecture.md))
+- **Observation:** 25D vector (see [architecture.md](../architecture.md))
 - **Action:** 4D `[0, 1]` — motor commands in X-configuration
 - **Reward:** task-specific (see `_compute_reward`)
 
@@ -20,7 +20,7 @@ Tasks (via `TaskType`):
 - `HOVER` — stay at target position
 - `DELIVERY` — pick up at A, drop at B
 - `DELIVERY_ROUTE` — visit N waypoints, avoiding obstacles
-- `DEPLOYMENT` — same as route + domain randomization
+- `DEPLOYMENT` — same as route + domain randomization (wind, prop wear, battery temp)
 
 ## Agent
 
@@ -60,13 +60,18 @@ drone-ai train flycontrol --population 6 --ages 10 --steps 10000
 
 ## Loading a trained model
 
+Checkpoints live per-stage under the curriculum chain, e.g.
+`models/flycontrol/deployment/P 20-04-2026 flycontrol v1.pt`. See
+[training.md](../training.md#ui-curriculum-chain-warm-start) for the
+chain and the launcher's warm-start behavior.
+
 ```python
 from drone_ai.modules.flycontrol import PPOAgent
-agent = PPOAgent.from_file("models/flycontrol/P 20-04-2026 flycontrol v1.pt")
+agent = PPOAgent.from_file("models/flycontrol/deployment/P 20-04-2026 flycontrol v1.pt")
 action, _ = agent.select_action(obs, deterministic=True)
 ```
 
 Or via `DroneAI`:
 ```python
-DroneAI(flycontrol_model="models/flycontrol/...")
+DroneAI(flycontrol_model="models/flycontrol/deployment/...")
 ```

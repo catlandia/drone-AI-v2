@@ -22,12 +22,37 @@ FlyControl uses a **population of 6 PPO agents** trained in parallel with evolut
 
 | Stage | Task | Difficulty | Domain randomization |
 |-------|------|-----------:|:--------------------:|
-| Hover     | maintain position | 0.3 | off |
-| Delivery  | pickup + drop | 0.5 | off |
-| Route     | multi-waypoint | 0.6 | off |
-| Deployment| full mission | 1.0 | **on** |
+| Hover          | maintain position       | 0.3 | off |
+| Waypoint       | hover with drifting target | 0.9 | off |
+| Delivery       | pickup + drop           | 0.5 | off |
+| Delivery Route | multi-stop with obstacles | 0.6 | off |
+| Deployment     | full mission, wind + wear | 1.0 | **on** |
 
-Domain randomization (mass, gravity variance) kicks in at the last stage to improve real-world transfer.
+Domain randomization (wind gusts, prop wear, battery temperature
+variance) kicks in at the last stage to improve real-world transfer.
+
+### UI curriculum chain (warm-start)
+
+The launcher trains stages in curriculum order, each warm-starting
+from the previous stage's latest checkpoint:
+
+```
+hover → waypoint → delivery → delivery_route → deployment
+```
+
+On launch, `TrainerUI` first looks for the stage's own newest
+checkpoint (so a second hover run resumes hover). If there is none,
+it falls back to the nearest earlier stage with trained weights.
+Hover is the only stage that ever cold-starts. Deployment sits at the
+end and keeps refining on top of `delivery_route`.
+
+Checkpoints save into per-stage subfolders:
+`models/flycontrol/{stage}/{Grade} {DD-MM-YYYY} flycontrol v{N}.pt`.
+
+The HUD subtitle during training shows `base: <filename>` (or
+`base: fresh` for the cold-start case). The launcher's curriculum
+strip lists each stage's latest checkpoint, with `— (warm from X)`
+for stages that will inherit from an earlier one.
 
 ### Command
 
