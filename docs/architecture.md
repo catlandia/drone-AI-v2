@@ -133,7 +133,27 @@ drift) so training matches sim-to-real expectations more tightly.
 ## Grading and run log
 
 Every training/eval run appends a row to `models/runs.csv`. Training
-launches from the UI auto-save to `models/{Grade} {DD-MM-YYYY} flycontrol v{N}.pt`.
+launches from the UI auto-save to
+`models/flycontrol/{stage}/{Grade} {DD-MM-YYYY} flycontrol v{N}.pt`.
+
+### Curriculum chain
+
+The five flycontrol stages train in sequence, each warm-starting from
+the previous stage's latest checkpoint:
+
+```
+hover → waypoint → delivery → delivery_route → deployment
+```
+
+When a stage launches, the trainer first looks for that stage's own
+newest checkpoint (so a second hover run resumes hover). If there is
+none, it falls back to the nearest earlier stage with trained weights.
+Hover is the only stage that ever starts from scratch. Deployment sits
+at the end and keeps refining on top of delivery_route.
+
+The launcher's curriculum strip shows each stage's latest checkpoint
+or, for untrained stages, which earlier stage will supply the
+warm-start weights.
 
 ## File layout
 

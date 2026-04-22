@@ -14,7 +14,10 @@ from typing import Callable, Dict, List, Optional
 import pygame
 
 from drone_ai.grading import RunLogger, parse_model_name
-from drone_ai.viz.trainer_ui import STAGE_DEFS, TrainConfig, TrainerUI
+from drone_ai.viz.trainer_ui import (
+    STAGE_DEFS, STAGE_ORDER, TrainConfig, TrainerUI,
+    latest_flycontrol_checkpoint,
+)
 
 
 # ---- Styling --------------------------------------------------------------
@@ -72,7 +75,6 @@ WINDOW_H = 820
 
 RUN_LOG_PATH = "models/runs.csv"
 MODELS_ROOT = "models"
-MODULES = ("flycontrol", "manager", "pathfinder", "perception")
 
 
 def _load_recent_runs(limit: int = 5) -> List[Dict[str, str]]:
@@ -83,23 +85,16 @@ def _load_recent_runs(limit: int = 5) -> List[Dict[str, str]]:
     return rows[-limit:][::-1]
 
 
-def _latest_checkpoint_per_module() -> Dict[str, str]:
-    """Scan models/{module}/ dirs and return the newest checkpoint name per
-    module (by filename version). Returns {} if models dir missing."""
+def _latest_flycontrol_per_stage() -> Dict[str, str]:
+    """Newest flycontrol checkpoint filename for each curriculum stage.
+    Used by the launcher strip so the user can see which stages have
+    trained weights on disk and which will warm-start from a predecessor.
+    """
     latest: Dict[str, str] = {}
-    for mod in MODULES:
-        mdir = os.path.join(MODELS_ROOT, mod)
-        if not os.path.isdir(mdir):
-            continue
-        best_v = -1
-        best_name = ""
-        for fname in os.listdir(mdir):
-            parsed = parse_model_name(fname)
-            if parsed and parsed["module"] == mod and parsed["version"] > best_v:
-                best_v = parsed["version"]
-                best_name = fname
-        if best_name:
-            latest[mod] = best_name
+    for stage in STAGE_ORDER:
+        path = latest_flycontrol_checkpoint(MODELS_ROOT, stage)
+        if path:
+            latest[stage] = os.path.basename(path)
     return latest
 
 
@@ -110,7 +105,7 @@ class Launcher:
         self.selected_idx: int = 0
         self.total_updates = 400  # default per-stage training budget
         self._recent_runs: List[Dict[str, str]] = _load_recent_runs()
-        self._latest_ckpt: Dict[str, str] = _latest_checkpoint_per_module()
+        self._latest_ckpt: Dict[str, str] = _latest_flycontrol_per_stage()
 
     def _init_pygame(self):
         """Idempotent pygame + window + font init.
@@ -193,7 +188,7 @@ class Launcher:
             # Pull in the run and checkpoint the child just wrote so the
             # bottom strip reflects the fresh result without restarting.
             self._recent_runs = _load_recent_runs()
-            self._latest_ckpt = _latest_checkpoint_per_module()
+            self._latest_ckpt = _latest_flycontrol_per_stage()
 
     # ---- Layout ---------------------------------------------------------
 
@@ -307,26 +302,33 @@ class Launcher:
                 self.screen.blit(self.font_sm.render(line, True, TEXT), (lx, ly))
                 ly += 16
 
-        # ---- Latest checkpoints (right) ----
+        # ---- Curriculum chain (right) ----
+        # Each stage trains on top of the previous stage's latest
+        # checkpoint. "—" means no weights yet; "(warm)" means this stage
+        # has no weights itself but will inherit from an earlier stage.
         rx = strip_rect.x + col_w + 16
         ry = strip_rect.y + 10
         self.screen.blit(
-            self.font_md.render("Latest checkpoints (models/<module>/)", True, TEXT_TITLE),
+            self.font_md.render("Curriculum chain (models/flycontrol/<stage>/)",
+                                True, TEXT_TITLE),
             (rx, ry),
         )
         ry += 24
-        if not self._latest_ckpt:
-            self.screen.blit(
-                self.font_sm.render("  no checkpoints yet", True, TEXT_DIM),
-                (rx, ry),
-            )
-        else:
-            for mod in MODULES:
-                name = self._latest_ckpt.get(mod)
-                label = f"  {mod:<12}{name if name else '—'}"
-                color = TEXT if name else TEXT_DIM
-                self.screen.blit(self.font_sm.render(label, True, color), (rx, ry))
-                ry += 16
+        warm_source: Optional[str] = None
+        for stage in STAGE_ORDER:
+            name = self._latest_ckpt.get(stage)
+            if name:
+                warm_source = stage
+                label = f"  {stage:<16}{name}"
+                color = TEXT
+            elif warm_source is not None:
+                label = f"  {stage:<16}— (warm from {warm_source})"
+                color = TEXT_ACCENT
+            else:
+                label = f"  {stage:<16}— (fresh)"
+                color = TEXT_DIM
+            self.screen.blit(self.font_sm.render(label, True, color), (rx, ry))
+            ry += 16
 
     def _blit_wrapped(self, text: str, x: int, y: int, max_w: int, font, color):
         words = text.split(" ")

@@ -17,13 +17,21 @@ import os
 
 from drone_ai.grading import (
     RunLogger, RunRecord, score_to_flycontrol_grade,
-    generate_model_name, next_version,
+    generate_model_name, next_version, parse_model_name,
 )
 from drone_ai.modules.flycontrol.agent import PPOAgent, PPOConfig
 from drone_ai.modules.flycontrol.environment import (
     FlyControlEnv, TaskType, OBS_DIM, ACT_DIM,
 )
 from drone_ai.viz.renderer3d import Renderer
+
+
+# Curriculum chain — each stage warm-starts from the previous stage's
+# latest checkpoint. Hover trains from scratch; deployment sits at the
+# end and keeps learning on top of delivery_route's base.
+STAGE_ORDER: List[str] = [
+    "hover", "waypoint", "delivery", "delivery_route", "deployment",
+]
 
 
 STAGE_DEFS: Dict[str, Dict] = {
@@ -65,6 +73,54 @@ STAGE_DEFS: Dict[str, Dict] = {
 }
 
 
+def flycontrol_stage_dir(models_root: str, stage: str) -> str:
+    """Where a stage's flycontrol checkpoints live on disk.
+
+    Stage subfolders keep the curriculum auditable: every hover run ends
+    up in models/flycontrol/hover/, every waypoint run in
+    models/flycontrol/waypoint/, etc. Lets the launcher show per-stage
+    progress and lets the next stage find a specific predecessor base.
+    """
+    return os.path.join(models_root, "flycontrol", stage)
+
+
+def latest_flycontrol_checkpoint(models_root: str, stage: str) -> Optional[str]:
+    """Return absolute path to the newest flycontrol checkpoint for this
+    stage (by version), or None if the stage has no checkpoints yet."""
+    sdir = flycontrol_stage_dir(models_root, stage)
+    if not os.path.isdir(sdir):
+        return None
+    best_v = -1
+    best_name = ""
+    for fname in os.listdir(sdir):
+        parsed = parse_model_name(fname)
+        if parsed and parsed["module"] == "flycontrol" and parsed["version"] > best_v:
+            best_v = parsed["version"]
+            best_name = fname
+    return os.path.join(sdir, best_name) if best_name else None
+
+
+def resolve_warm_start(models_root: str, stage: str) -> Optional[str]:
+    """Pick the checkpoint to warm-start this stage from.
+
+    First preference: this stage's own latest checkpoint (resume training
+    where we left off). Fallback: the nearest earlier stage's latest
+    checkpoint (curriculum step-up). Returns None for hover on a fresh
+    install — hover has no predecessor and no prior run.
+    """
+    own = latest_flycontrol_checkpoint(models_root, stage)
+    if own:
+        return own
+    if stage not in STAGE_ORDER:
+        return None
+    idx = STAGE_ORDER.index(stage)
+    for prev in reversed(STAGE_ORDER[:idx]):
+        prev_ckpt = latest_flycontrol_checkpoint(models_root, prev)
+        if prev_ckpt:
+            return prev_ckpt
+    return None
+
+
 @dataclass
 class TrainConfig:
     stage: str = "hover"
@@ -87,6 +143,19 @@ class TrainerUI:
             seed=cfg.seed,
         )
         self.agent = PPOAgent(obs_dim=OBS_DIM, act_dim=ACT_DIM, config=PPOConfig())
+        # Curriculum warm-start: try this stage's newest checkpoint, else
+        # fall back to the previous stage's. Lets deployment keep refining
+        # on top of delivery_route instead of training from scratch.
+        self.base_model_name: Optional[str] = None
+        models_root = os.path.dirname(cfg.log_path) or "models"
+        warm = resolve_warm_start(models_root, cfg.stage)
+        if warm is not None:
+            try:
+                self.agent.load(warm)
+                self.base_model_name = os.path.basename(warm)
+                print(f"[trainer] warm-started {cfg.stage} from {warm}")
+            except Exception as e:
+                print(f"[trainer] warm-start skipped ({warm}): {e}")
         self.renderer = Renderer(title=f"Training — {self.stage_def['title']}")
 
         self.obs, _ = self.env.reset(seed=cfg.seed)
@@ -138,17 +207,16 @@ class TrainerUI:
         return self.update_idx >= self.cfg.total_updates
 
     def _auto_save_path(self) -> str:
-        # Checkpoints live per-module: models/flycontrol/, models/perception/,
-        # etc. The run log sits at the top (models/runs.csv) and covers all
-        # modules, so we have to join in the module folder explicitly.
+        # Per-stage subfolder (models/flycontrol/<stage>/) so the curriculum
+        # chain stays auditable — each stage's checkpoints live separately
+        # and the next stage can pick up from the specific predecessor.
         models_root = os.path.dirname(self.cfg.log_path) or "models"
-        module = "flycontrol"
-        module_dir = os.path.join(models_root, module)
-        os.makedirs(module_dir, exist_ok=True)
+        stage_dir = flycontrol_stage_dir(models_root, self.cfg.stage)
+        os.makedirs(stage_dir, exist_ok=True)
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
         grade = score_to_flycontrol_grade(best)
-        version = next_version(module_dir, module)
-        return os.path.join(module_dir, generate_model_name(grade, module, version))
+        version = next_version(stage_dir, "flycontrol")
+        return os.path.join(stage_dir, generate_model_name(grade, "flycontrol", version))
 
     def _log_run(self) -> None:
         minutes = (time.monotonic() - self._start_time) / 60.0
@@ -227,9 +295,14 @@ class TrainerUI:
         if self.latest_loss is not None:
             metrics.append(("loss", f"{self.latest_loss:.3f}", None))
 
+        subtitle = self.stage_def["subtitle"]
+        if self.base_model_name:
+            subtitle = f"{subtitle}   •   base: {self.base_model_name}"
+        else:
+            subtitle = f"{subtitle}   •   base: fresh"
         hud = {
             "title":    f"TRAINING — {self.stage_def['title']}",
-            "subtitle": self.stage_def["subtitle"],
+            "subtitle": subtitle,
             "metrics":  metrics,
         }
         self.renderer.draw_scene(
