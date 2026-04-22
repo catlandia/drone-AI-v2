@@ -1,40 +1,40 @@
 {
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"
+  },
   "permissions": {
     "allow": [
-      "WebFetch(domain:github.com)",
-      "Bash(gh api *)",
-      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/simulation\")",
-      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/flycontrol\")",
-      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/pathfinder\")",
-      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/perception\")",
-      "Bash(mkdir -p \"E:/Projects/Drone AI/src/drone_ai/modules/manager\")",
-      "Bash(py --version)",
-      "Bash(py -c ' *)",
-      "Bash(gh auth *)",
-      "Bash(git init *)",
-      "Bash(gh repo *)",
-      "Bash(git add *)",
-      "Bash(git commit -m ' *)",
-      "Bash(py -c \"import pygame; print\\(pygame.version.ver\\)\")",
-      "Bash(py -m pip install pygame)",
-      "Bash(py -m pip index versions pygame)",
-      "Bash(py -m pip install pygame-ce)",
-      "Bash(git push *)",
-      "Bash(PYTHONPATH=src SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage hover --updates 1)",
-      "Bash(py -m pip install -e . --quiet)",
-      "Bash(py -c \"import pygame; print\\('pygame version:', pygame.version.ver\\); print\\('SDL:', pygame.version.SDL\\)\")",
-      "Bash(py -c \"import drone_ai; print\\(drone_ai.__file__\\)\")",
-      "Bash(py -c \"from drone_ai.viz.launcher import _load_recent_runs, _latest_checkpoint_per_module; print\\('runs:', _load_recent_runs\\(\\)\\); print\\('ckpts:', _latest_checkpoint_per_module\\(\\)\\)\")",
-      "Bash(wait)",
-      "Bash(py -m drone_ai.cli --help)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage manager)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage swarm)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage storage)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage personality)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage pathfinder)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage adaptive)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage perception)",
-      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage hover --updates 1)"
-    ]
-  }
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "mcp__*"
+    ],
+    "deny": [
+      "Bash(format *)",
+      "Bash(diskpart*)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(del /s /q C:\\*)",
+      "Bash(rd /s /q C:\\*)",
+      "Bash(dd if=* of=/dev/sd*)",
+      "Bash(mkfs*)",
+      "Bash(shred /dev/*)",
+      "Bash(cipher /w:C*)"
+    ],
+    "ask": [
+      "Bash(git push*)",
+      "Bash(gh pr create*)",
+      "Bash(gh release create*)"
+    ],
+    "defaultMode": "bypassPermissions"
+  },
+  "enableAllProjectMcpServers": true,
+  "disabledMcpjsonServers": [],
+  "skipDangerousModePermissionPrompt": true
 }

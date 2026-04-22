@@ -1,39 +1,39 @@
 """Stage launcher — the main window you see when you start the app.
 
-Pick a card and a new window opens running that layer's training /
-benchmark. Three sections:
+State machine:
+  MENU      — pick a card.
+  PICKER    — confirm the launch and pick the base checkpoint to
+              warm-start from (or "fresh" / "auto").
+  RUNNING   — work runs (FlyControl stages open the live 3D trainer
+              window in the same process; benchmarks run in a worker
+              thread with stdout streamed into a panel).
+  RESULTS   — the most recent run's grade/score stays on screen until
+              the user dismisses it. No auto-close.
 
-  FlyControl curriculum (Layer 4)
-    hover → waypoint → delivery → delivery_route → deployment
-    Each stage warm-starts from the previous stage's latest checkpoint.
-
-  Module benchmarks (Layers 1, 2, 3, 5)
-    Manager / Pathfinder / Perception / Adaptive
-    Each runs its standalone benchmark and writes a tier-named .pt
-    to models/<module>/ plus a row to models/runs.csv.
-
-  Phase 2 ops (Layers 6, 7, 8) + Free-fly demo
-    Storage / Personality / Swarm / Demo
-    Storage round-trips synthetic field rows; Personality auto-exports
-    from the latest FlyControl checkpoint; Swarm runs the coordinator
-    on synthetic multi-drone scenes; Demo runs the PD controller live.
+The launcher itself does not exit between launches — every transition
+returns here.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
+import threading
 import time
+import traceback
+from collections import deque
+from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import pygame
 
 from drone_ai.grading import RunLogger, parse_model_name
 from drone_ai.viz.trainer_ui import (
     STAGE_DEFS, STAGE_ORDER, TrainConfig, TrainerUI,
-    latest_flycontrol_checkpoint,
+    flycontrol_stage_dir, latest_flycontrol_checkpoint,
 )
 
 
@@ -48,20 +48,25 @@ TEXT          = (225, 230, 240)
 TEXT_DIM      = (150, 160, 175)
 TEXT_ACCENT   = (120, 220, 150)
 TEXT_TITLE    = (180, 220, 250)
+TEXT_WARN     = (240, 180, 90)
 
 
 @dataclass
 class StageCard:
-    key: str                # routes to the launch dispatcher
+    key: str
     title: str
     subtitle: str
     description: str
     accent: tuple
-    badge: str = ""         # small tag e.g. "Layer 4" / "demo"
-    section: str = "main"   # section heading bucket
+    badge: str = ""
+    section: str = "main"
+    # Directory paths (relative to MODELS_ROOT) the picker scans for
+    # warm-start candidates. Empty list = no warm-start needed.
+    base_dirs: List[str] = field(default_factory=list)
+    # Free-form text shown in the picker — what the base provides.
+    base_hint: str = ""
 
 
-# Section keys / labels in display order.
 SECTIONS = [
     ("flycontrol", "FlyControl Curriculum (Layer 4)"),
     ("modules",    "Module Benchmarks (Layers 1, 2, 3, 5)"),
@@ -69,51 +74,89 @@ SECTIONS = [
 ]
 
 
+# Per-FlyControl-stage warm-start dirs: this stage's own dir (resume)
+# plus every earlier stage in the chain (curriculum step-up).
+def _flycontrol_base_dirs(stage: str) -> List[str]:
+    if stage not in STAGE_ORDER:
+        return [f"flycontrol/{stage}"]
+    idx = STAGE_ORDER.index(stage)
+    dirs = [f"flycontrol/{stage}"]
+    for prev in reversed(STAGE_ORDER[:idx]):
+        dirs.append(f"flycontrol/{prev}")
+    return dirs
+
+
 STAGE_CARDS: List[StageCard] = [
     # ---- FlyControl curriculum (Layer 4) -----------------------------------
     StageCard("hover", "Hover", "Learn to stay still",
               "Basic attitude + altitude hold. The drone must hover near a target point.",
-              (120, 220, 150), badge="L4 · stage 1", section="flycontrol"),
+              (120, 220, 150), badge="L4 · stage 1", section="flycontrol",
+              base_dirs=_flycontrol_base_dirs("hover"),
+              base_hint="Resume hover, or start fresh — hover has no curriculum predecessor."),
     StageCard("waypoint", "Waypoint", "Navigate to scattered targets",
               "Harder hover variant — target drifts further out each episode.",
-              (140, 200, 230), badge="L4 · stage 2", section="flycontrol"),
+              (140, 200, 230), badge="L4 · stage 2", section="flycontrol",
+              base_dirs=_flycontrol_base_dirs("waypoint"),
+              base_hint="Warm-start from a hover or waypoint checkpoint."),
     StageCard("delivery", "Delivery", "Pickup → dropzone, one package",
               "Fly to a pickup point, then to a dropzone. Single-delivery task.",
-              (240, 170, 90), badge="L4 · stage 3", section="flycontrol"),
+              (240, 170, 90), badge="L4 · stage 3", section="flycontrol",
+              base_dirs=_flycontrol_base_dirs("delivery"),
+              base_hint="Warm-start from a waypoint / delivery checkpoint."),
     StageCard("delivery_route", "Delivery Route", "Multi-stop with obstacles",
               "2-6 deliveries, up to 20 obstacles. Route optimization + avoidance.",
-              (220, 140, 210), badge="L4 · stage 4", section="flycontrol"),
+              (220, 140, 210), badge="L4 · stage 4", section="flycontrol",
+              base_dirs=_flycontrol_base_dirs("delivery_route"),
+              base_hint="Warm-start from a delivery / route checkpoint."),
     StageCard("deployment", "Deployment Ready", "Full difficulty + domain rand",
               "Max difficulty, randomized physics. Prepares policy for sim-to-real.",
-              (240, 100, 110), badge="L4 · stage 5", section="flycontrol"),
+              (240, 100, 110), badge="L4 · stage 5", section="flycontrol",
+              base_dirs=_flycontrol_base_dirs("deployment"),
+              base_hint="Warm-start from delivery_route. Final curriculum stage."),
 
     # ---- Module benchmarks (Layers 1, 2, 3, 5) ----------------------------
     StageCard("manager", "Manager", "Mission planning",
               "Greedy-TSP routing, priority queue, pre-flight feasibility. Layer 1 benchmark.",
-              (200, 180, 100), badge="L1", section="modules"),
+              (200, 180, 100), badge="L1", section="modules",
+              base_dirs=["manager"],
+              base_hint="Manager benchmarks are stateless — pick any prior grade or fresh."),
     StageCard("pathfinder", "Pathfinder", "A* + RRT planning",
               "Path optimality + collision-avoidance benchmark across random worlds.",
-              (160, 200, 100), badge="L2", section="modules"),
+              (160, 200, 100), badge="L2", section="modules",
+              base_dirs=["pathfinder"],
+              base_hint="Pathfinder is rules-based; the base only sets the version slot."),
     StageCard("perception", "Perception", "Obstacle detection",
               "Detection rate, false positives, position error across scenes. Sub-models split.",
-              (100, 200, 200), badge="L3", section="modules"),
+              (100, 200, 200), badge="L3", section="modules",
+              base_dirs=["perception"],
+              base_hint="Perception benchmark; sub-models grade independently."),
     StageCard("adaptive", "Adaptive", "Online fine-tune",
               "Warden-guarded online learning vs frozen baseline on a perturbed env. Layer 5.",
-              (220, 110, 220), badge="L5", section="modules"),
+              (220, 110, 220), badge="L5", section="modules",
+              base_dirs=[f"flycontrol/{s}" for s in STAGE_ORDER],
+              base_hint="Pick a FlyControl checkpoint to adapt. Auto = newest across all stages."),
 
     # ---- Phase 2 ops (Layers 6, 7, 8) + demo -----------------------------
     StageCard("storage", "Storage", "Field-log round-trip",
               "Layer 6: write synthetic field rows, read them back, verify the on-drone log.",
-              (180, 130, 100), badge="L6", section="phase2"),
+              (180, 130, 100), badge="L6", section="phase2",
+              base_dirs=["storage"],
+              base_hint="Storage has no model — the picker is informational only."),
     StageCard("personality", "Personality", "Export delta artifact",
               "Layer 7: build a transferable personality from the latest FlyControl checkpoint.",
-              (130, 180, 220), badge="L7", section="phase2"),
+              (130, 180, 220), badge="L7", section="phase2",
+              base_dirs=[f"flycontrol/{s}" for s in STAGE_ORDER],
+              base_hint="Pick the FlyControl baseline the personality is computed against."),
     StageCard("swarm", "Swarm", "Multi-drone coordinator",
               "Layer 8: visual mutual avoidance + swarm-mate-failed contingency benchmark.",
-              (220, 200, 120), badge="L8", section="phase2"),
+              (220, 200, 120), badge="L8", section="phase2",
+              base_dirs=["swarm"],
+              base_hint="Swarm is rules-based; the picker only confirms launch."),
     StageCard("demo", "Free-Fly Demo", "Run the full stack live",
               "No training — just watch the drone fly its demo mission in 3D.",
-              (180, 220, 250), badge="demo", section="phase2"),
+              (180, 220, 250), badge="demo", section="phase2",
+              base_dirs=[f"flycontrol/{s}" for s in STAGE_ORDER],
+              base_hint="Optional: pick a FlyControl model to fly. Fresh uses the PD controller."),
 ]
 
 
@@ -133,7 +176,6 @@ def _load_recent_runs(limit: int = 6) -> List[Dict[str, str]]:
 
 
 def _latest_flycontrol_per_stage() -> Dict[str, str]:
-    """Newest flycontrol checkpoint filename for each curriculum stage."""
     latest: Dict[str, str] = {}
     for stage in STAGE_ORDER:
         path = latest_flycontrol_checkpoint(MODELS_ROOT, stage)
@@ -142,49 +184,174 @@ def _latest_flycontrol_per_stage() -> Dict[str, str]:
     return latest
 
 
-# ---- Per-layer dispatch ----------------------------------------------------
+def _scan_checkpoints(base_dirs: List[str]) -> List[Tuple[str, str]]:
+    """Return [(label, absolute_path), …] of valid .pt files under
+    each base dir. Newest first — the picker uses this order so the
+    user can confirm the auto-selection by pressing Enter."""
+    found: List[Tuple[float, str, str]] = []
+    for rel in base_dirs:
+        full = os.path.join(MODELS_ROOT, rel)
+        if not os.path.isdir(full):
+            continue
+        for fname in os.listdir(full):
+            parsed = parse_model_name(fname)
+            if not parsed:
+                continue
+            path = os.path.join(full, fname)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0.0
+            label = f"{rel}/{fname}"
+            found.append((mtime, label, path))
+    found.sort(reverse=True)
+    return [(lbl, p) for _, lbl, p in found]
 
-def _run_module(key: str) -> None:
-    """Dispatch a non-FlyControl card. Each branch runs a benchmark
-    that prints to stdout and writes a runs.csv row + a tier-named
-    .pt under models/<module>/. The launcher reopens after the call
-    returns and refreshes its strip from the new files."""
-    if key == "manager":
+
+# ---- Per-card runner ------------------------------------------------------
+
+def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> None:
+    """Execute the work for a card. FlyControl stages open the live
+    3D trainer (own window); other cards run inline in the calling
+    thread and write to stdout. The launcher wraps non-FlyControl
+    calls in a worker thread + redirected stdout so the launcher
+    window can render a progress panel concurrently.
+    """
+    if card.section == "flycontrol":
+        cfg = TrainConfig(
+            stage=card.key,
+            total_updates=total_updates,
+            warm_start_path=base_path,
+            hold_on_finish=True,
+        )
+        TrainerUI(cfg).run()
+        return
+
+    if card.key == "manager":
         from drone_ai.modules.manager.train import run_training
         run_training(grade="P", trials=20, save_dir="models/manager")
-    elif key == "pathfinder":
+    elif card.key == "pathfinder":
         from drone_ai.modules.pathfinder.train import run_training
         run_training(trials=30, save_dir="models/pathfinder")
-    elif key == "perception":
+    elif card.key == "perception":
         from drone_ai.modules.perception.train import run_training, run_submodels
         run_training(grade="P", trials=80, save_dir="models/perception")
         run_submodels(grade="P", trials=40, save_dir="models/perception")
-    elif key == "adaptive":
+    elif card.key == "adaptive":
         from drone_ai.modules.adaptive.train import run_training
-        run_training(model_path=None, episodes=3, save_dir="models/adaptive")
-    elif key == "storage":
+        run_training(model_path=base_path, episodes=3, save_dir="models/adaptive")
+    elif card.key == "storage":
         from drone_ai.modules.storage.train import run_training
         run_training(n_missions=20, save_dir="models/storage")
-    elif key == "personality":
+    elif card.key == "personality":
         from drone_ai.modules.personality.train import run_training
+        # The personality benchmark looks up the newest checkpoint
+        # internally; we pass nothing — the picker is informational
+        # for this card. (Future: wire base_path through.)
         run_training(save_dir="models/personality")
-    elif key == "swarm":
+    elif card.key == "swarm":
         from drone_ai.modules.swarm.train import run_training
         run_training(trials=30, n_drones=4, save_dir="models/swarm")
-    elif key == "demo":
-        _run_demo()
+    elif card.key == "demo":
+        _run_demo(base_path)
     else:
-        raise ValueError(f"unknown module key: {key}")
+        raise ValueError(f"unknown card key: {card.key}")
+
+
+# ---- Worker for non-FlyControl benchmarks ---------------------------------
+
+class BenchmarkWorker:
+    """Runs the work in a daemon thread. Stdout/stderr routed into a
+    bounded deque so the launcher's running-view can tail the last N
+    lines without blocking on IO."""
+
+    def __init__(self, card: StageCard, base_path: Optional[str], total_updates: int):
+        self.card = card
+        self.base_path = base_path
+        self.total_updates = total_updates
+        self.lines: Deque[str] = deque(maxlen=200)
+        self._buf = io.StringIO()
+        self._done = threading.Event()
+        self._error: Optional[str] = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        class _Tee(io.TextIOBase):
+            def __init__(self, sink: Deque[str]):
+                super().__init__()
+                self._sink = sink
+                self._line = ""
+            def write(self, s):
+                if not s:
+                    return 0
+                self._line += s
+                while "\n" in self._line:
+                    nl, self._line = self._line.split("\n", 1)
+                    if nl.strip():
+                        self._sink.append(nl)
+                return len(s)
+            def flush(self):
+                if self._line.strip():
+                    self._sink.append(self._line)
+                    self._line = ""
+
+        tee = _Tee(self.lines)
+        try:
+            with redirect_stdout(tee), redirect_stderr(tee):
+                _run_card(self.card, self.base_path, self.total_updates)
+        except Exception as e:
+            self._error = f"{type(e).__name__}: {e}"
+            self.lines.append(self._error)
+            for tb in traceback.format_exc().splitlines():
+                self.lines.append(tb)
+        finally:
+            try:
+                tee.flush()
+            except Exception:
+                pass
+            self._done.set()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    @property
+    def error(self) -> Optional[str]:
+        return self._error
+
+
+# ---- Launcher state machine -----------------------------------------------
+
+class LauncherState:
+    MENU = "menu"
+    PICKER = "picker"
+    RUNNING = "running"
+    RESULTS = "results"
 
 
 class Launcher:
     def __init__(self):
         self._init_pygame()
+        self.state = LauncherState.MENU
         self.hover_idx: Optional[int] = None
         self.selected_idx: int = 0
-        self.total_updates = 400  # FlyControl per-stage budget
+        self.total_updates = 400
         self._recent_runs: List[Dict[str, str]] = _load_recent_runs()
         self._latest_ckpt: Dict[str, str] = _latest_flycontrol_per_stage()
+
+        # Picker state
+        self._picker_card: Optional[StageCard] = None
+        self._picker_options: List[Tuple[str, Optional[str]]] = []
+        self._picker_idx: int = 0
+
+        # Runner / results state
+        self._worker: Optional[BenchmarkWorker] = None
+        self._run_t0: float = 0.0
+        self._results_card: Optional[StageCard] = None
+        self._results_lines: List[Tuple[str, str]] = []
 
     def _init_pygame(self):
         pygame.init()
@@ -202,6 +369,9 @@ class Launcher:
         try:
             while running:
                 running = self._handle_events()
+                # State updates between event handling and draw.
+                if self.state == LauncherState.RUNNING:
+                    self._tick_runner()
                 self._draw()
                 pygame.display.flip()
                 self.clock.tick(60)
@@ -214,6 +384,17 @@ class Launcher:
     # ---- Events ---------------------------------------------------------
 
     def _handle_events(self) -> bool:
+        if self.state == LauncherState.MENU:
+            return self._handle_menu_events()
+        elif self.state == LauncherState.PICKER:
+            return self._handle_picker_events()
+        elif self.state == LauncherState.RUNNING:
+            return self._handle_running_events()
+        elif self.state == LauncherState.RESULTS:
+            return self._handle_results_events()
+        return True
+
+    def _handle_menu_events(self) -> bool:
         mx, my = pygame.mouse.get_pos()
         self.hover_idx = self._card_at(mx, my)
         for ev in pygame.event.get():
@@ -227,41 +408,157 @@ class Launcher:
                 elif ev.key in (pygame.K_UP, pygame.K_LEFT):
                     self.selected_idx = (self.selected_idx - 1) % len(STAGE_CARDS)
                 elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    self._launch(STAGE_CARDS[self.selected_idx])
-                elif ev.key == pygame.K_PLUS or ev.key == pygame.K_EQUALS:
+                    self._open_picker(STAGE_CARDS[self.selected_idx])
+                elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     self.total_updates = min(10000, self.total_updates + 100)
-                elif ev.key == pygame.K_MINUS:
+                elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     self.total_updates = max(50, self.total_updates - 100)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if self.hover_idx is not None:
                     self.selected_idx = self.hover_idx
-                    self._launch(STAGE_CARDS[self.hover_idx])
+                    self._open_picker(STAGE_CARDS[self.hover_idx])
         return True
 
-    # ---- Launch ---------------------------------------------------------
+    def _handle_picker_events(self) -> bool:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_ESCAPE,):
+                    self.state = LauncherState.MENU
+                elif ev.key == pygame.K_DOWN:
+                    self._picker_idx = (self._picker_idx + 1) % len(self._picker_options)
+                elif ev.key == pygame.K_UP:
+                    self._picker_idx = (self._picker_idx - 1) % len(self._picker_options)
+                elif ev.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self._launch_selected()
+        return True
 
-    def _launch(self, card: StageCard):
-        # Hide launcher while child runs.
-        pygame.display.quit()
-        try:
-            if card.section == "flycontrol":
-                cfg = TrainConfig(stage=card.key, total_updates=self.total_updates)
+    def _handle_running_events(self) -> bool:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return False
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                # Esc during a benchmark is informational only — the
+                # worker thread is daemonized but we shouldn't bail
+                # out of the launcher mid-run. Show a hint instead.
+                pass
+        return True
+
+    def _handle_results_events(self) -> bool:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                return False
+            if ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                self._refresh_strip()
+                self.state = LauncherState.MENU
+        return True
+
+    # ---- Picker ---------------------------------------------------------
+
+    def _open_picker(self, card: StageCard) -> None:
+        self._picker_card = card
+        # Picker options: explicit fresh + auto-newest + every found ckpt.
+        opts: List[Tuple[str, Optional[str]]] = []
+        opts.append(("(fresh — start without a base model)", None))
+        scanned = _scan_checkpoints(card.base_dirs)
+        if scanned:
+            # Auto = the same as the first scanned (newest), but labeled
+            # so the user understands the difference.
+            opts.append((f"(auto — newest: {os.path.basename(scanned[0][1])})", scanned[0][1]))
+            for label, path in scanned:
+                opts.append((label, path))
+        self._picker_options = opts
+        # Default to "auto" if a checkpoint exists, else "fresh".
+        self._picker_idx = 1 if len(opts) > 1 else 0
+        self.state = LauncherState.PICKER
+
+    def _launch_selected(self) -> None:
+        card = self._picker_card
+        if card is None:
+            return
+        _, path = self._picker_options[self._picker_idx]
+
+        if card.section == "flycontrol":
+            # FlyControl stages open their own window; we don't run
+            # them in a worker thread. Tear down the launcher window
+            # while the trainer owns the display, then come back.
+            pygame.display.quit()
+            try:
+                cfg = TrainConfig(
+                    stage=card.key,
+                    total_updates=self.total_updates,
+                    warm_start_path=path,
+                    hold_on_finish=True,
+                )
                 TrainerUI(cfg).run()
-            else:
-                # Non-FlyControl cards run as headless benchmarks. They
-                # print progress to stdout and finish in seconds.
-                print(f"\n[launcher] running '{card.key}' benchmark…")
-                t0 = time.monotonic()
-                _run_module(card.key)
-                print(f"[launcher] '{card.key}' done in {time.monotonic()-t0:.1f}s")
-        except Exception as e:
-            import traceback
-            print(f"[launcher] stage '{card.key}' raised: {e}")
-            traceback.print_exc()
-        finally:
-            self._init_pygame()
-            self._recent_runs = _load_recent_runs()
-            self._latest_ckpt = _latest_flycontrol_per_stage()
+            except Exception as e:
+                print(f"[launcher] FlyControl '{card.key}' raised: {e}")
+                traceback.print_exc()
+            finally:
+                self._init_pygame()
+                self._refresh_strip()
+                # FlyControl trainer has its own results screen, so we
+                # come straight back to MENU rather than RESULTS.
+                self.state = LauncherState.MENU
+            return
+
+        # Non-FlyControl: spawn a worker, switch to RUNNING.
+        self._worker = BenchmarkWorker(card, path, self.total_updates)
+        self._run_t0 = time.monotonic()
+        self._results_card = card
+        self.state = LauncherState.RUNNING
+        self._worker.start()
+
+    # ---- Runner tick ----------------------------------------------------
+
+    def _tick_runner(self) -> None:
+        if self._worker is None:
+            return
+        if self._worker.done:
+            self._build_results()
+            self.state = LauncherState.RESULTS
+            self._worker = None
+
+    def _build_results(self) -> None:
+        elapsed = time.monotonic() - self._run_t0
+        card = self._results_card
+        rows = _load_recent_runs(limit=12)
+        # Find the most recent row that matches this card's module.
+        latest = None
+        if card is not None:
+            for row in rows:
+                module = row.get("module", "")
+                if module == card.key or (card.key in ("perception",) and module == "perception"):
+                    latest = row
+                    break
+        lines: List[Tuple[str, str]] = []
+        title = card.title if card is not None else "Run"
+        lines.append((title, "title"))
+        if card is not None:
+            lines.append((card.subtitle, "dim"))
+        lines.append(("", "dim"))
+        if self._worker is not None and self._worker.error:
+            lines.append((f"FAILED: {self._worker.error}", "warn"))
+        elif latest is not None:
+            grade = latest.get("grade", "—")
+            best = latest.get("best_score", "—")
+            avg = latest.get("avg_score", "—")
+            stage = latest.get("stage", "—")
+            lines.append((f"Grade: {grade}", "accent"))
+            lines.append((f"Best score: {best}", "text"))
+            lines.append((f"Avg score:  {avg}", "text"))
+            lines.append((f"Stage:      {stage}", "text"))
+        else:
+            lines.append(("(no runs.csv row found for this card)", "warn"))
+        lines.append((f"Elapsed:    {elapsed:.1f}s", "text"))
+        lines.append(("", "dim"))
+        lines.append(("Press any key / click to return to the launcher.", "accent"))
+        self._results_lines = lines
+
+    def _refresh_strip(self) -> None:
+        self._recent_runs = _load_recent_runs()
+        self._latest_ckpt = _latest_flycontrol_per_stage()
 
     # ---- Layout ---------------------------------------------------------
 
@@ -270,27 +567,22 @@ class Launcher:
     CARD_H = 145
     CARD_GAP = 14
     GRID_X = 40
-    SECTION_H_PAD = 26   # vertical padding under each section header
-    HEADER_H = 24        # height of the section header text
+    SECTION_H_PAD = 26
+    HEADER_H = 24
 
-    def _section_layout(self) -> List[tuple]:
-        """Return [(section_key, y_start, [(card_index, rect), …]), …]
-        in display order. Cards within a section flow GRID_COLS-wide.
-        """
-        # First pass: collect indices per section.
+    def _section_layout(self) -> List[Tuple[str, int, List[Tuple[int, pygame.Rect]]]]:
         per_section: Dict[str, List[int]] = {k: [] for k, _ in SECTIONS}
         for i, card in enumerate(STAGE_CARDS):
             per_section.setdefault(card.section, []).append(i)
-
-        layout = []
-        y = 168  # below the header / budget controls
-        for key, label in SECTIONS:
+        layout: List[Tuple[str, int, List[Tuple[int, pygame.Rect]]]] = []
+        y = 168
+        for key, _ in SECTIONS:
             ids = per_section.get(key, [])
             if not ids:
                 continue
             section_y = y
             y += self.HEADER_H + self.SECTION_H_PAD
-            cards_in_section = []
+            cards_in_section: List[Tuple[int, pygame.Rect]] = []
             for slot, idx in enumerate(ids):
                 col = slot % self.GRID_COLS
                 row = slot // self.GRID_COLS
@@ -309,28 +601,27 @@ class Launcher:
                     return idx
         return None
 
-    def _card_rect(self, target_idx: int) -> Optional[pygame.Rect]:
-        for _, _, cards in self._section_layout():
-            for idx, rect in cards:
-                if idx == target_idx:
-                    return rect
-        return None
-
     # ---- Draw -----------------------------------------------------------
 
     def _draw(self):
         self.screen.fill(BG)
-        # Header
+        self._draw_menu()
+        if self.state == LauncherState.PICKER:
+            self._draw_picker_modal()
+        elif self.state == LauncherState.RUNNING:
+            self._draw_running_modal()
+        elif self.state == LauncherState.RESULTS:
+            self._draw_results_modal()
+
+    def _draw_menu(self):
         title = self.font_xl.render("DRONE AI — 8 Layer Stack", True, TEXT_TITLE)
         self.screen.blit(title, (40, 36))
         sub = self.font_md.render(
-            "Pick a card. FlyControl stages open a 3D training window; "
-            "module benchmarks run headless and write to models/runs.csv.",
+            "Pick a card → confirm the base model → run. Nothing auto-exits; the results screen waits for you.",
             True, TEXT_DIM,
         )
         self.screen.blit(sub, (40, 78))
 
-        # Budget control (only meaningful for FlyControl stages)
         budget_y = 110
         budget = self.font_md.render(
             f"FlyControl training budget: {self.total_updates} updates",
@@ -338,15 +629,13 @@ class Launcher:
         )
         self.screen.blit(budget, (40, budget_y))
         hint = self.font_sm.render(
-            "  [+/-] adjust budget   [Enter] launch selected   [Q] quit",
+            "  [+/-] adjust budget   [Enter] open picker   [Esc/Q] quit",
             True, TEXT_DIM,
         )
         self.screen.blit(hint, (40, budget_y + 18))
 
-        # Section headers + cards
-        layout = self._section_layout()
         section_label_lookup = dict(SECTIONS)
-        for key, header_y, cards in layout:
+        for key, header_y, cards in self._section_layout():
             label = section_label_lookup.get(key, key)
             hdr = self.font_lg.render(label, True, TEXT_TITLE)
             self.screen.blit(hdr, (self.GRID_X, header_y))
@@ -358,8 +647,6 @@ class Launcher:
             )
             for idx, rect in cards:
                 self._draw_card(idx, rect)
-
-        # Run-log + saved-checkpoint strip across the bottom.
         self._draw_run_strip()
 
     def _draw_card(self, idx: int, rect: pygame.Rect):
@@ -369,21 +656,16 @@ class Launcher:
         bg = PANEL_ACTIVE if is_sel else PANEL_HOVER if is_hover else PANEL
         pygame.draw.rect(self.screen, bg, rect, border_radius=8)
         pygame.draw.rect(self.screen, card.accent, rect, 2, border_radius=8)
-        # Title
         t = self.font_lg.render(card.title, True, TEXT)
         self.screen.blit(t, (rect.x + 12, rect.y + 10))
-        # Accent chip
         chip_w = 36
         pygame.draw.rect(self.screen, card.accent,
                          (rect.right - chip_w - 12, rect.y + 14, chip_w, 6),
                          border_radius=3)
-        # Subtitle
         s = self.font_md.render(card.subtitle, True, TEXT_ACCENT)
         self.screen.blit(s, (rect.x + 12, rect.y + 38))
-        # Description (wrap)
         self._blit_wrapped(card.description, rect.x + 12, rect.y + 62,
                            rect.width - 24, self.font_sm, TEXT_DIM)
-        # Layer / key badges
         if card.badge:
             badge = self.font_sm.render(card.badge, True, card.accent)
             self.screen.blit(badge, (rect.x + 12, rect.bottom - 18))
@@ -391,8 +673,6 @@ class Launcher:
         self.screen.blit(key_b, (rect.right - key_b.get_width() - 12, rect.bottom - 18))
 
     def _draw_run_strip(self):
-        # Compute strip start from the layout so it always sits below
-        # the last card row, no matter how many sections / cards exist.
         layout = self._section_layout()
         bottom_of_cards = 0
         for _, _, cards in layout:
@@ -401,13 +681,12 @@ class Launcher:
         strip_y = bottom_of_cards + 18
         strip_h = WINDOW_H - strip_y - 14
         if strip_h < 80:
-            return  # no room — skip rather than overlap
+            return
         strip_rect = pygame.Rect(40, strip_y, WINDOW_W - 80, strip_h)
         pygame.draw.rect(self.screen, PANEL, strip_rect, border_radius=8)
         pygame.draw.rect(self.screen, BORDER, strip_rect, 1, border_radius=8)
 
         col_w = strip_rect.width // 2
-        # ---- Recent runs (left) ----
         lx = strip_rect.x + 14
         ly = strip_rect.y + 8
         self.screen.blit(
@@ -437,7 +716,6 @@ class Launcher:
                 self.screen.blit(self.font_sm.render(line, True, TEXT), (lx, ly))
                 ly += 14
 
-        # ---- Curriculum chain (right) ----
         rx = strip_rect.x + col_w + 14
         ry = strip_rect.y + 8
         self.screen.blit(
@@ -462,6 +740,133 @@ class Launcher:
             self.screen.blit(self.font_sm.render(label, True, color), (rx, ry))
             ry += 14
 
+    # ---- Modals ---------------------------------------------------------
+
+    def _modal_rect(self, w: int = 760, h: int = 540) -> pygame.Rect:
+        return pygame.Rect(
+            (WINDOW_W - w) // 2,
+            (WINDOW_H - h) // 2,
+            w, h,
+        )
+
+    def _draw_modal_bg(self, rect: pygame.Rect, accent=BORDER) -> None:
+        overlay = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        overlay.fill((10, 14, 22, 180))
+        self.screen.blit(overlay, (0, 0))
+        pygame.draw.rect(self.screen, (24, 30, 42), rect, border_radius=10)
+        pygame.draw.rect(self.screen, accent, rect, 2, border_radius=10)
+
+    def _draw_picker_modal(self):
+        card = self._picker_card
+        if card is None:
+            return
+        rect = self._modal_rect(820, 580)
+        self._draw_modal_bg(rect, accent=card.accent)
+        t = self.font_xl.render(f"Launch — {card.title}", True, TEXT_TITLE)
+        self.screen.blit(t, (rect.x + 24, rect.y + 18))
+        sub = self.font_md.render(card.subtitle, True, TEXT_ACCENT)
+        self.screen.blit(sub, (rect.x + 24, rect.y + 58))
+        if card.base_hint:
+            h = self.font_sm.render(card.base_hint, True, TEXT_DIM)
+            self.screen.blit(h, (rect.x + 24, rect.y + 80))
+
+        # Options list
+        opts_y = rect.y + 120
+        self.screen.blit(
+            self.font_md.render("Pick a base model:", True, TEXT_TITLE),
+            (rect.x + 24, opts_y - 24),
+        )
+        list_h = rect.height - 200
+        max_visible = max(1, list_h // 22)
+        first = max(0, min(len(self._picker_options) - max_visible,
+                           self._picker_idx - max_visible // 2))
+        for i in range(first, min(first + max_visible, len(self._picker_options))):
+            label, _ = self._picker_options[i]
+            is_sel = (i == self._picker_idx)
+            row_y = opts_y + (i - first) * 22
+            row_rect = pygame.Rect(rect.x + 16, row_y, rect.width - 32, 20)
+            if is_sel:
+                pygame.draw.rect(self.screen, (45, 75, 120), row_rect, border_radius=4)
+            text_color = TEXT if is_sel else TEXT_DIM
+            # Truncate long labels.
+            display = label
+            max_chars = (rect.width - 60) // 8
+            if len(display) > max_chars:
+                display = "…" + display[-max_chars + 1:]
+            self.screen.blit(self.font_sm.render(display, True, text_color),
+                             (rect.x + 24, row_y + 2))
+
+        # Footer
+        footer_y = rect.bottom - 36
+        if card.section == "flycontrol":
+            tip = (f"  Budget: {self.total_updates} updates  "
+                   "[↑/↓] pick  [Enter] launch  [Esc] back")
+        else:
+            tip = "  [↑/↓] pick  [Enter] launch  [Esc] back"
+        self.screen.blit(self.font_sm.render(tip, True, TEXT_DIM), (rect.x + 24, footer_y))
+
+    def _draw_running_modal(self):
+        card = self._results_card
+        if card is None:
+            return
+        rect = self._modal_rect(820, 580)
+        self._draw_modal_bg(rect, accent=card.accent)
+        t = self.font_xl.render(f"Running — {card.title}", True, TEXT_TITLE)
+        self.screen.blit(t, (rect.x + 24, rect.y + 18))
+        elapsed = time.monotonic() - self._run_t0
+        spin = ".." + "." * (int(elapsed * 4) % 4)
+        sub = self.font_md.render(
+            f"{card.subtitle}  ·  {elapsed:.1f}s {spin}", True, TEXT_ACCENT,
+        )
+        self.screen.blit(sub, (rect.x + 24, rect.y + 58))
+
+        log_y = rect.y + 96
+        self.screen.blit(
+            self.font_md.render("Live output", True, TEXT_TITLE),
+            (rect.x + 24, log_y - 22),
+        )
+        log_rect = pygame.Rect(rect.x + 16, log_y, rect.width - 32, rect.height - 140)
+        pygame.draw.rect(self.screen, (12, 16, 24), log_rect, border_radius=6)
+        pygame.draw.rect(self.screen, BORDER, log_rect, 1, border_radius=6)
+
+        if self._worker is not None:
+            lines = list(self._worker.lines)
+            line_h = 14
+            max_visible = (log_rect.height - 12) // line_h
+            visible = lines[-max_visible:] if len(lines) > max_visible else lines
+            ly = log_rect.y + 6
+            for line in visible:
+                # Truncate long lines so they don't overflow the panel.
+                disp = line if len(line) <= 110 else line[:107] + "…"
+                self.screen.blit(self.font_sm.render(disp, True, TEXT), (log_rect.x + 8, ly))
+                ly += line_h
+
+        footer = self.font_sm.render(
+            "  Worker thread is running — the launcher waits here until it finishes.",
+            True, TEXT_DIM,
+        )
+        self.screen.blit(footer, (rect.x + 24, rect.bottom - 28))
+
+    def _draw_results_modal(self):
+        rect = self._modal_rect(680, 420)
+        accent = self._results_card.accent if self._results_card else BORDER
+        self._draw_modal_bg(rect, accent=accent)
+        styles = {
+            "title":  (self.font_xl, TEXT_TITLE),
+            "accent": (self.font_lg, TEXT_ACCENT),
+            "warn":   (self.font_lg, TEXT_WARN),
+            "text":   (self.font_md, TEXT),
+            "dim":    (self.font_sm, TEXT_DIM),
+        }
+        y = rect.y + 24
+        for text, style in self._results_lines:
+            font, color = styles.get(style, styles["text"])
+            surf = font.render(text, True, color)
+            self.screen.blit(surf, (rect.x + (rect.width - surf.get_width()) // 2, y))
+            y += font.get_height() + 6
+
+    # ---- Helpers --------------------------------------------------------
+
     def _blit_wrapped(self, text: str, x: int, y: int, max_w: int, font, color):
         words = text.split(" ")
         line = ""
@@ -482,12 +887,10 @@ class Launcher:
 
 # ---- Free-fly demo --------------------------------------------------------
 
-def _run_demo():
+def _run_demo(model_path: Optional[str] = None):
     """Run the built-in DroneAI (PD controller + full 4-layer stack) with 3D viz.
 
-    Auto-generates a fresh mission (new obstacles + deliveries) whenever
-    the current mission finishes or the drone crashes — so the viewer
-    never just "stops flying."
+    Auto-generates a fresh mission whenever the current one ends.
     """
     import numpy as np
     from drone_ai.drone import DroneAI
@@ -502,7 +905,7 @@ def _run_demo():
     def fresh_mission() -> DroneAI:
         seed = run_seed[0]
         run_seed[0] += 1
-        d = DroneAI(seed=seed)
+        d = DroneAI(seed=seed, flycontrol_model=model_path)
         d.reset()
         rng = np.random.default_rng(seed)
         w = World()
@@ -569,28 +972,34 @@ def main():
     parser.add_argument(
         "--stage", default=None,
         help=("Skip the menu and launch this card directly. "
-              "Accepts any card key — FlyControl stages "
-              "(hover/waypoint/delivery/delivery_route/deployment), "
-              "module benchmarks (manager/pathfinder/perception/adaptive/"
-              "storage/personality/swarm), or demo."),
+              "FlyControl stages, module benchmarks, or 'demo'."),
     )
     parser.add_argument("--updates", type=int, default=400)
+    parser.add_argument(
+        "--warm-start", default=None,
+        help="Optional explicit warm-start checkpoint path for FlyControl stages.",
+    )
     args = parser.parse_args()
 
     if args.stage:
         exit_code = 0
         try:
             if args.stage in STAGE_DEFS:
-                TrainerUI(TrainConfig(stage=args.stage, total_updates=args.updates)).run()
-            elif args.stage == "demo":
-                _run_demo()
+                cfg = TrainConfig(
+                    stage=args.stage,
+                    total_updates=args.updates,
+                    warm_start_path=args.warm_start,
+                    hold_on_finish=True,
+                )
+                TrainerUI(cfg).run()
             else:
-                # Non-FlyControl module benchmark.
-                try:
-                    _run_module(args.stage)
-                except ValueError:
+                # Look up the card (or fall back to demo) and run inline.
+                card = next((c for c in STAGE_CARDS if c.key == args.stage), None)
+                if card is None:
                     print(f"Unknown stage: {args.stage}", file=sys.stderr)
                     exit_code = 2
+                else:
+                    _run_card(card, args.warm_start, args.updates)
         finally:
             try:
                 pygame.quit()

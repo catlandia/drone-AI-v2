@@ -130,6 +130,16 @@ class TrainConfig:
     save_path: Optional[str] = None
     run_tag: str = ""                        # free-form tag for the run log
     log_path: str = "models/runs.csv"
+    # Optional explicit warm-start checkpoint path. If None, the trainer
+    # falls back to resolve_warm_start() (this stage's newest, then the
+    # nearest earlier stage's). Set by the launcher's pre-launch picker
+    # so the user can pin the base model instead of accepting the
+    # automatic choice.
+    warm_start_path: Optional[str] = None
+    # If True, after training completes the trainer holds the window
+    # open on a results screen until the user dismisses it. The launcher
+    # turns this on so missions don't auto-exit the moment they finish.
+    hold_on_finish: bool = True
 
 
 class TrainerUI:
@@ -143,12 +153,15 @@ class TrainerUI:
             seed=cfg.seed,
         )
         self.agent = PPOAgent(obs_dim=OBS_DIM, act_dim=ACT_DIM, config=PPOConfig())
-        # Curriculum warm-start: try this stage's newest checkpoint, else
-        # fall back to the previous stage's. Lets deployment keep refining
-        # on top of delivery_route instead of training from scratch.
+        # Warm-start order (PLAN.md §4 curriculum chain):
+        #   1. Explicit cfg.warm_start_path — picked by the launcher's
+        #      pre-launch picker. The user wins.
+        #   2. resolve_warm_start() — this stage's newest, then the
+        #      nearest earlier stage's. Lets deployment keep refining
+        #      on top of delivery_route instead of training from scratch.
         self.base_model_name: Optional[str] = None
         models_root = os.path.dirname(cfg.log_path) or "models"
-        warm = resolve_warm_start(models_root, cfg.stage)
+        warm = cfg.warm_start_path or resolve_warm_start(models_root, cfg.stage)
         if warm is not None:
             try:
                 self.agent.load(warm)
@@ -175,6 +188,8 @@ class TrainerUI:
 
     def run(self) -> bool:
         running = True
+        finished_naturally = False
+        save_path: Optional[str] = None
         try:
             while running and self.update_idx < self.cfg.total_updates:
                 running = self.renderer.handle_events(1 / 60)
@@ -189,6 +204,8 @@ class TrainerUI:
                 self._render_frame()
                 self.renderer.flip()
 
+            finished_naturally = self.update_idx >= self.cfg.total_updates
+
             # Always persist the trained weights — previously the UI path
             # left save_path=None so training runs vanished on exit. Name
             # the file with the tier-list convention so runs.csv rows and
@@ -199,12 +216,61 @@ class TrainerUI:
                 print(f"[trainer] saved checkpoint -> {save_path}")
             except Exception as e:
                 print(f"[trainer] save failed: {e}")
+
+            # Hold-on-finish results screen: the user asked for the
+            # window not to disappear the second training ends. Wait
+            # for an explicit dismiss instead of closing immediately.
+            if (
+                finished_naturally
+                and self.cfg.hold_on_finish
+                and self.renderer.is_open()
+            ):
+                self._show_results_screen(save_path)
         finally:
             # Always record the run, even if the user quit early — the
             # minutes and best-score so far are still meaningful data points.
             self._log_run()
             self.renderer.close()
-        return self.update_idx >= self.cfg.total_updates
+        return finished_naturally
+
+    def _show_results_screen(self, save_path: Optional[str]) -> None:
+        """Block on a results panel until the user presses any key /
+        clicks / closes the window. Lets them read the final grade
+        before returning to the launcher."""
+        from drone_ai.grading import GRADE_NAMES, GRADE_DESCRIPTIONS
+        avg = (sum(self.recent_rewards) / len(self.recent_rewards)) if self.recent_rewards else 0.0
+        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
+        grade = score_to_flycontrol_grade(best) if self.best_ep_reward != -float("inf") else "—"
+        minutes = (time.monotonic() - self._start_time) / 60.0
+        results_lines = [
+            ("FlyControl — " + self.stage_def["title"], "title"),
+            (f"Stage: {self.cfg.stage}", "dim"),
+            ("", "dim"),
+            (f"Grade:    {grade}  ({GRADE_NAMES.get(grade,'')})", "accent"),
+            (f"Best R:   {best:+.1f}", "text"),
+            (f"Avg R:    {avg:+.1f}", "text"),
+            (f"Updates:  {self.update_idx}/{self.cfg.total_updates}", "text"),
+            (f"Episodes: {self.episode_idx}", "text"),
+            (f"Time:     {minutes:.1f} min", "text"),
+            ("", "dim"),
+            (f"Saved: {save_path or '(none)'}", "dim"),
+            ("", "dim"),
+            ("Press any key / click / close to return to the launcher.", "accent"),
+        ]
+        # Run the renderer's idle loop until the user dismisses it.
+        if hasattr(self.renderer, "show_modal_text"):
+            self.renderer.show_modal_text(results_lines)
+            return
+        # Fallback for older renderers: just keep the last frame visible
+        # until the user closes the window via the renderer's own input.
+        try:
+            keep_open = True
+            while keep_open and self.renderer.is_open():
+                keep_open = self.renderer.handle_events(1 / 60)
+                self._render_frame()
+                self.renderer.flip()
+        except Exception:
+            pass
 
     def _auto_save_path(self) -> str:
         # Per-stage subfolder (models/flycontrol/<stage>/) so the curriculum

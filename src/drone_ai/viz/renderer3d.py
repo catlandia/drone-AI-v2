@@ -696,6 +696,66 @@ class Renderer:
         pygame.display.flip()
         self.clock.tick(60)
 
+    def is_open(self) -> bool:
+        """True if the display window is still alive."""
+        try:
+            return pygame.display.get_init() and pygame.display.get_surface() is not None
+        except Exception:
+            return False
+
+    def show_modal_text(self, lines) -> None:
+        """Block on a centered text modal until the user dismisses it.
+
+        `lines` is a sequence of (text, style) tuples where style is one
+        of "title", "accent", "text", "dim". Used by trainers/benchmarks
+        to display a final results screen instead of auto-exiting.
+        """
+        styles = {
+            "title":  (self.font_lg, TEXT),
+            "accent": (self.font_md, TEXT_OK),
+            "text":   (self.font_md, TEXT),
+            "dim":    (self.font_sm, TEXT_DIM),
+        }
+        # Pre-render so we can size the panel.
+        rendered = []
+        max_w = 0
+        for text, style in lines:
+            font, color = styles.get(style, styles["text"])
+            surf = font.render(text, True, color)
+            rendered.append(surf)
+            max_w = max(max_w, surf.get_width())
+        line_h = max(s.get_height() for s in rendered) + 4
+        panel_w = max(420, max_w + 60)
+        panel_h = len(rendered) * line_h + 40
+        panel_x = (self.width - panel_w) // 2
+        panel_y = (self.height - panel_h) // 2
+
+        running = True
+        while running and self.is_open():
+            for ev in pygame.event.get():
+                if ev.type in (pygame.QUIT,):
+                    running = False
+                elif ev.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+                    running = False
+            # Dim background behind the panel.
+            try:
+                surf = self.screen
+                overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+                overlay.fill((10, 14, 22, 180))
+                surf.blit(overlay, (0, 0))
+                pygame.draw.rect(surf, (24, 30, 42),
+                                 (panel_x, panel_y, panel_w, panel_h), border_radius=10)
+                pygame.draw.rect(surf, (90, 120, 160),
+                                 (panel_x, panel_y, panel_w, panel_h), 2, border_radius=10)
+                y = panel_y + 20
+                for s in rendered:
+                    surf.blit(s, (panel_x + (panel_w - s.get_width()) // 2, y))
+                    y += line_h
+                pygame.display.flip()
+                self.clock.tick(60)
+            except Exception:
+                break
+
     def close(self):
         """Tear down the display window only — do NOT pygame.quit().
 
