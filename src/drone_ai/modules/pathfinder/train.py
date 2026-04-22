@@ -17,7 +17,8 @@ import numpy as np
 from drone_ai.simulation.world import World, Obstacle
 from drone_ai.modules.pathfinder.algorithms import PathPlanner
 from drone_ai.grading import (
-    ModelGrader, PathfinderMetrics, generate_model_name, next_version
+    ModelGrader, PathfinderMetrics, generate_model_name, next_version,
+    RunLogger, RunRecord,
 )
 
 
@@ -135,6 +136,15 @@ def run_training(
     # Save a placeholder .pt so file naming convention is consistent
     import torch
     torch.save({"grade": grade, "algorithm": "A*+RRT", "score": score}, str(path))
+
+    try:
+        RunLogger().append(RunRecord(
+            module="pathfinder", stage="benchmark",
+            best_score=score, avg_score=score, grade=grade,
+            minutes=0.0, episodes=trials,
+        ))
+    except Exception as e:
+        print(f"[pathfinder] run-log append failed: {e}")
 
     if verbose:
         print(f"  Saved: {path}")

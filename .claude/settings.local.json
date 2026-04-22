@@ -26,7 +26,15 @@
       "Bash(py -c \"import drone_ai; print\\(drone_ai.__file__\\)\")",
       "Bash(py -c \"from drone_ai.viz.launcher import _load_recent_runs, _latest_checkpoint_per_module; print\\('runs:', _load_recent_runs\\(\\)\\); print\\('ckpts:', _latest_checkpoint_per_module\\(\\)\\)\")",
       "Bash(wait)",
-      "Bash(py -m drone_ai.cli --help)"
+      "Bash(py -m drone_ai.cli --help)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage manager)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage swarm)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage storage)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage personality)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage pathfinder)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage adaptive)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage perception)",
+      "Bash(SDL_VIDEODRIVER=dummy py -m drone_ai.viz.launcher --stage hover --updates 1)"
     ]
   }
 }

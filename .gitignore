@@ -12,6 +12,7 @@ venv/
 # Models and logs
 models/**/*.pt
 models/**/*.json
+models/runs.csv
 !models/**/.gitkeep
 logs/
 experiments/*.json

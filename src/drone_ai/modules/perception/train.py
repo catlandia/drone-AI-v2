@@ -17,7 +17,8 @@ import numpy as np
 from drone_ai.simulation.world import World
 from drone_ai.modules.perception.detector import PerceptionAI, _GRADE_PARAMS
 from drone_ai.grading import (
-    ModelGrader, PerceptionMetrics, generate_model_name, next_version, GRADE_ORDER
+    ModelGrader, PerceptionMetrics, generate_model_name, next_version, GRADE_ORDER,
+    RunLogger, RunRecord,
 )
 
 
@@ -130,6 +131,15 @@ def run_training(
     }
     with open(path.with_suffix(".json"), "w") as f:
         json.dump(results, f, indent=2)
+
+    try:
+        RunLogger().append(RunRecord(
+            module="perception", stage="benchmark",
+            best_score=score, avg_score=score, grade=measured_grade,
+            minutes=0.0, episodes=trials,
+        ))
+    except Exception as e:
+        print(f"[perception] run-log append failed: {e}")
 
     if verbose:
         print(f"  Saved: {path}")

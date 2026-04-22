@@ -10,7 +10,8 @@ import numpy as np
 
 from drone_ai.modules.manager.planner import MissionPlanner, DeliveryRequest, Priority
 from drone_ai.grading import (
-    ModelGrader, ManagerMetrics, generate_model_name, next_version, GRADE_ORDER
+    ModelGrader, ManagerMetrics, generate_model_name, next_version, GRADE_ORDER,
+    RunLogger, RunRecord,
 )
 
 
@@ -142,6 +143,15 @@ def run_training(
             "timestamp": datetime.now().isoformat(),
             "model_file": fname,
         }, f, indent=2)
+
+    try:
+        RunLogger().append(RunRecord(
+            module="manager", stage="benchmark",
+            best_score=score, avg_score=score, grade=measured_grade,
+            minutes=0.0, episodes=trials,
+        ))
+    except Exception as e:
+        print(f"[manager] run-log append failed: {e}")
 
     if verbose:
         print(f"  Saved: {path}")
