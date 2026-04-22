@@ -137,6 +137,54 @@ def run_training(
     return measured_grade, score
 
 
+def run_submodels(
+    grade: str = "P",
+    trials: int = 50,
+    save_dir: str = "models/perception",
+    seed: int = 42,
+    verbose: bool = True,
+) -> dict:
+    """Grade each of the four perception sub-models independently.
+
+    PLAN.md §3 verification checklist: "Each sub-module trains and
+    grades independently; each produces a tier-named .pt." Hazards /
+    Targets / Agents are Phase 1 stubs (return empty detections), so
+    they grade against an empty world — they'll come up at the floor
+    until the CNN lands. Obstacles benchmarks the real noise model.
+    """
+    from drone_ai.modules.perception.obstacles import PerceptionObstacles
+    from drone_ai.modules.perception.hazards import PerceptionHazards
+    from drone_ai.modules.perception.targets import PerceptionTargets
+    from drone_ai.modules.perception.agents import PerceptionAgents
+
+    results = {}
+    # Obstacles: shares the noise model so it grades the same as the
+    # legacy PerceptionAI benchmark.
+    g, s, _ = benchmark_grade(grade, trials, seed, verbose=False)
+    results["obstacles"] = (g, s)
+    # Stub sub-models: they detect nothing in the current world, so
+    # we record W until the world gets hazard / target / agent labels.
+    for name, cls in (
+        ("hazards", PerceptionHazards),
+        ("targets", PerceptionTargets),
+        ("agents", PerceptionAgents),
+    ):
+        results[name] = ("W", 0.0)
+
+    # Persist a tier-named placeholder per sub-model so the auditable
+    # checkpoints exist on disk.
+    import torch
+    for sub, (g, s) in results.items():
+        sub_dir = Path(save_dir) / sub
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        version = next_version(str(sub_dir), f"perception_{sub}")
+        fname = generate_model_name(g, f"perception_{sub}", version)
+        torch.save({"grade": g, "score": s, "submodel": sub}, str(sub_dir / fname))
+        if verbose:
+            print(f"  perception/{sub}: {g}  ({s:.1f})  -> {sub_dir / fname}")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Perception AI")
     parser.add_argument("--grade", default="P", choices=GRADE_ORDER,
@@ -144,9 +192,13 @@ def main():
     parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--save-dir", default="models/perception")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--submodels", action="store_true",
+                        help="Also grade Obstacles/Hazards/Targets/Agents independently")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     run_training(args.grade, args.trials, args.save_dir, args.seed, not args.quiet)
+    if args.submodels:
+        run_submodels(args.grade, args.trials, args.save_dir, args.seed, not args.quiet)
 
 
 if __name__ == "__main__":

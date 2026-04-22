@@ -31,6 +31,7 @@ from drone_ai.modules.perception.detector import PerceptionAI
 from drone_ai.modules.perception.tracker import ObjectTracker
 from drone_ai.modules.manager.planner import MissionPlanner, Priority
 from drone_ai.modules.adaptive import AdaptiveConfig, AdaptiveLearner
+from drone_ai.modules.storage import Storage, MissionRecord, MissionOutcome
 
 
 class SystemState(Enum):
@@ -86,6 +87,11 @@ class DroneAI:
         seed: Optional[int] = None,
         adaptive: bool = False,
         adaptive_config: Optional[AdaptiveConfig] = None,
+        drone_id: str = "default",
+        mission_id: str = "",
+        mission_class: str = "STANDARD",
+        deadline_type: str = "SOFT",
+        storage_root: str = "logs/storage",
     ):
         self.grades = grades or GradeConfig()
         self._rng = np.random.default_rng(seed)
@@ -110,12 +116,28 @@ class DroneAI:
         if flycontrol_model:
             self._agent = PPOAgent.from_file(flycontrol_model)
 
+        # Layer 6 — Storage of Learnings. Always created so a mission
+        # outcome can be appended even when adaptive is off; it just
+        # won't carry update rows in that case.
+        self.drone_id = str(drone_id)
+        self.mission_id = str(mission_id) or f"mission-{int(self._rng.integers(0, 2**31))}"
+        self.mission_class = str(mission_class)
+        self.deadline_type = str(deadline_type)
+        self.storage = Storage(self.drone_id, root=storage_root)
+
         # Adaptive (5th) layer — optional. Only meaningful when a trained
         # FlyControl agent is loaded. Fully offline: all fine-tuning happens
-        # on the drone's own compute.
+        # on the drone's own compute. Wired to Storage so every accept /
+        # reject / rollback is logged for Layer 7 personality selection.
         self._adaptive: Optional[AdaptiveLearner] = None
         if adaptive and self._agent is not None:
-            self._adaptive = AdaptiveLearner(self._agent, adaptive_config)
+            self._adaptive = AdaptiveLearner(
+                self._agent,
+                adaptive_config,
+                storage=self.storage,
+                mission_id=self.mission_id,
+                layer="flycontrol",
+            )
             self.grades.adaptive = self.grades.adaptive if self.grades.adaptive != "—" else "A"
 
         # State
@@ -364,6 +386,31 @@ class DroneAI:
         summary["crashed"] = self.physics.state.crashed
         summary["system_state"] = self.system_state.value
         summary["grades"] = self.grades.summary()
+
+        # Layer 6: log this mission's outcome so Layer 7 can rank
+        # drones later and the A/B subset comparator has cohort data.
+        if self.physics.state.crashed:
+            outcome = MissionOutcome.CRASHED
+        elif summary.get("completion_rate", 0.0) >= 0.999:
+            outcome = MissionOutcome.DELIVERED
+        elif summary.get("completed", 0) > 0:
+            outcome = MissionOutcome.DELIVERED_LATE
+        elif self.system_state == SystemState.LANDED:
+            outcome = MissionOutcome.RTB
+        else:
+            outcome = MissionOutcome.ABORTED
+        try:
+            self.storage.record_mission(MissionRecord(
+                mission_id=self.mission_id,
+                outcome=outcome,
+                deadline_type=self.deadline_type,
+                mission_class=self.mission_class,
+                deliveries_done=int(summary.get("completed", 0)),
+                deliveries_total=int(summary.get("total", 0)),
+            ))
+        except Exception as e:
+            print(f"[drone] storage mission log failed: {e}")
+        summary["outcome"] = outcome.value
         return summary
 
     def get_status(self) -> FlightStatus:

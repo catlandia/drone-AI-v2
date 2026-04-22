@@ -57,7 +57,7 @@ def _run_episodes(
             obs = next_obs
             if done:
                 if learner is not None:
-                    learner.end_episode(next_obs)
+                    learner.end_episode(next_obs, total)
                 break
         rewards.append(total)
     return rewards
