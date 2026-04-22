@@ -147,6 +147,15 @@ class TrainConfig:
     # (useful when the curriculum chain is still empty and you just want
     # to exercise the training machinery).
     test_run: bool = False
+    # Behavior-cloning warm-up before PPO kicks in. Uses the PD
+    # controller as the imitation teacher so the actor has a sane
+    # starting policy instead of tumbling the drone on random noise.
+    # PLAN.md §8 + §18 explicitly calls for this. Defaults on for
+    # fresh (no-warm-start) runs; skipped when loading a real ckpt
+    # since we don't want to wipe learned weights.
+    bc_warmup: bool = True
+    bc_episodes: int = 6
+    bc_epochs: int = 60
 
 
 class TrainerUI:
@@ -191,6 +200,16 @@ class TrainerUI:
         # Run-log bookkeeping: capture wall-clock so the log has minutes.
         self._start_time = time.monotonic()
         self._all_rewards: List[float] = []
+        # BC warm-up status — exposed on the HUD so the user can tell
+        # the actor is being imitation-trained before PPO kicks in.
+        self._bc_status: Optional[str] = None
+        self._bc_loss: Optional[float] = None
+        # Only warm-up when there's no real base. Loading a trained
+        # checkpoint and then MSE-pulling it back toward the PD action
+        # would destroy what the previous stage learned.
+        self._should_bc = (
+            self.cfg.bc_warmup and self.base_model_name is None
+        )
 
     # ------------------------------------------------------------------
 
@@ -199,6 +218,14 @@ class TrainerUI:
         finished_naturally = False
         save_path: Optional[str] = None
         try:
+            # Step 0: Behavior-cloning warm-up (only for fresh starts).
+            if self._should_bc:
+                running = self._run_bc_warmup()
+                # Rewind the env so the first PPO step doesn't inherit
+                # the PD rollout's final state.
+                if running:
+                    self.obs, _ = self.env.reset(seed=self.cfg.seed)
+
             while running and self.update_idx < self.cfg.total_updates:
                 running = self.renderer.handle_events(1 / 60)
                 if not running:
@@ -329,6 +356,65 @@ class TrainerUI:
 
     # ------------------------------------------------------------------
 
+    def _run_bc_warmup(self) -> bool:
+        """Collect PD-controller rollouts, SL-train the actor on them.
+
+        Shows progress in the HUD so the user can tell what's
+        happening (BC can take a few seconds and the drone is not
+        moving on-screen while the SL epochs churn). Returns False if
+        the user closed the window during warm-up.
+        """
+        from drone_ai.modules.flycontrol.pd_controller import collect_pd_rollouts
+
+        # --- collect rollouts from the PD controller ---
+        self._bc_status = "Collecting PD rollouts…"
+        self._render_frame()
+        self.renderer.flip()
+        pd_obs, pd_acts = collect_pd_rollouts(
+            self.env,
+            n_episodes=self.cfg.bc_episodes,
+            max_steps=1500,
+            seed=self.cfg.seed,
+        )
+        print(f"[bc] collected {len(pd_obs)} (obs, act) pairs from "
+              f"{self.cfg.bc_episodes} PD episodes")
+
+        if len(pd_obs) == 0:
+            self._bc_status = None
+            return True
+
+        # --- SL pretraining ---
+        n_epochs = self.cfg.bc_epochs
+        running = [True]
+
+        def cb(epoch: int, loss: float) -> None:
+            self._bc_loss = float(loss)
+            self._bc_status = f"BC epoch {epoch}/{n_epochs}   loss={loss:.4f}"
+            # Pump events so the window stays responsive. The renderer
+            # returning False means the user closed the window.
+            alive = self.renderer.handle_events(0.0)
+            if not alive:
+                running[0] = False
+                raise KeyboardInterrupt("bc warmup cancelled by user")
+            self._render_frame()
+            self.renderer.flip()
+
+        try:
+            stats = self.agent.bc_warmup(
+                pd_obs, pd_acts,
+                n_epochs=n_epochs,
+                batch_size=128,
+                lr=1e-3,
+                progress_cb=cb,
+            )
+            print(f"[bc] done — final loss {stats.get('loss', float('nan')):.4f}")
+        except KeyboardInterrupt:
+            print("[bc] cancelled by user")
+            return False
+        finally:
+            self._bc_status = None
+        return running[0]
+
     def _collect_step(self):
         action, info = self.agent.select_action(self.obs, deterministic=False)
         next_obs, reward, terminated, truncated, _ = self.env.step(action)
@@ -390,6 +476,8 @@ class TrainerUI:
             # No base — label as a test run so the user can tell at a
             # glance this isn't a real curriculum step.
             subtitle = f"{subtitle}   •   base: fresh (TEST)"
+        if self._bc_status is not None:
+            subtitle = f"{subtitle}   •   {self._bc_status}"
         title_prefix = "TEST TRAINING" if (self.cfg.test_run or not self.base_model_name) else "TRAINING"
         hud = {
             "title":    f"{title_prefix} — {self.stage_def['title']}",

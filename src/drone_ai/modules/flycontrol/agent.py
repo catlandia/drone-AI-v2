@@ -51,10 +51,13 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(final.weight, gain=0.01)
         logit_hover = float(np.log(self.HOVER_THROTTLE / (1.0 - self.HOVER_THROTTLE)))
         nn.init.constant_(final.bias, logit_hover)
-        # Lower initial exploration std — -0.5 gives σ≈0.61 (huge on [0,1]),
-        # -1.0 gives σ≈0.37 which is still plenty of exploration without
-        # making every motor command random noise in the first episodes.
-        self.actor_log_std = nn.Parameter(torch.zeros(act_dim) - 1.0)
+        # Exploration std. A 5" FPV's motor commands are extremely
+        # leverage-sensitive — a ±0.3 jitter per motor (σ≈0.37,
+        # log_std=-1.0) inverts the drone within a second and makes
+        # every stochastic rollout a crash. log_std=-1.8 gives
+        # σ≈0.17, which lets PPO perturb the hover-biased actor
+        # enough to learn but not so much the drone flips on init.
+        self.actor_log_std = nn.Parameter(torch.zeros(act_dim) - 1.8)
         self.critic = nn.Sequential(
             nn.Linear(hidden, hidden // 2), nn.Tanh(),
             nn.Linear(hidden // 2, 1),
@@ -193,6 +196,79 @@ class PPOAgent:
 
         self.buffer.clear()
         return {"loss": float(np.mean(losses))}
+
+    def bc_warmup(
+        self,
+        observations: np.ndarray,
+        expert_actions: np.ndarray,
+        n_epochs: int = 60,
+        batch_size: int = 128,
+        lr: float = 1e-3,
+        progress_cb=None,
+        post_log_std: Optional[float] = -2.2,
+    ) -> Dict[str, float]:
+        """Supervised pre-training of the actor on (obs, expert_action)
+        pairs — Behavior Cloning from a PD controller.
+
+        PLAN.md §8 / §18: fresh PPO tumbles the drone in a handful of
+        steps. BC warm-up hands the actor a decent starting policy so
+        PPO has something to refine instead of something to survive.
+
+        Only the actor mean is updated (shared layers + actor_mean
+        head). Critic is left alone — it's warmed up implicitly by
+        the first PPO rollout.
+
+        After BC, `log_std` is clamped down to `post_log_std`
+        (default −2.2, so σ ≈ 0.11) so the stochastic policy doesn't
+        immediately destroy the learned mean with aggressive noise.
+        PPO's own updates to log_std will relax it back up during
+        real exploration if the advantages support it.
+
+        `progress_cb(epoch, avg_loss)` is called once per epoch so UIs
+        can show a progress bar.
+        """
+        import torch.nn.functional as F
+
+        if len(observations) == 0:
+            return {"loss": float("nan"), "epochs": 0, "samples": 0}
+
+        obs_t = torch.from_numpy(observations).float().to(self.device)
+        act_t = torch.from_numpy(expert_actions).float().to(self.device)
+        n = obs_t.shape[0]
+
+        # Train shared + actor_mean only. Everything else frozen.
+        actor_params = list(self.policy.shared.parameters()) + \
+                       list(self.policy.actor_mean.parameters())
+        opt = optim.Adam(actor_params, lr=lr)
+
+        last_loss = float("nan")
+        for epoch in range(n_epochs):
+            idx = torch.randperm(n, device=self.device)
+            losses = []
+            for start in range(0, n, batch_size):
+                b = idx[start:start + batch_size]
+                h = self.policy.shared(obs_t[b])
+                pred = self.policy.actor_mean(h)
+                loss = F.mse_loss(pred, act_t[b])
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(actor_params, self.config.max_grad_norm)
+                opt.step()
+                losses.append(loss.item())
+            last_loss = float(np.mean(losses)) if losses else float("nan")
+            if progress_cb is not None:
+                try:
+                    progress_cb(epoch + 1, last_loss)
+                except Exception:
+                    pass
+
+        # Tighten exploration noise so the BC-learned policy isn't
+        # drowned by sigma on the first stochastic rollouts.
+        if post_log_std is not None:
+            with torch.no_grad():
+                self.policy.actor_log_std.fill_(float(post_log_std))
+
+        return {"loss": last_loss, "epochs": n_epochs, "samples": int(n)}
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

@@ -217,7 +217,16 @@ class FlyControlEnv(gym.Env):
             reward -= 10.0 * (0.5 - obs_dist)
 
         if self.task == TaskType.HOVER:
-            reward += max(0.0, 2.0 - dist) * 0.5
+            # Two-band approach: a faint gradient all the way out to
+            # 20m so PPO has a learning signal while the drone is
+            # still flying toward the target, plus a steep on-target
+            # bonus so a well-trained hover still converges and caps
+            # out near the PD-teacher reference. Was zero beyond 2m
+            # before, which left PPO without useful gradient over the
+            # entire approach phase.
+            reward += max(0.0, 0.5 * (1.0 - dist / 20.0))
+            if dist < 2.0:
+                reward += max(0.0, 2.0 - dist) * 0.5
             if dist < 0.3:
                 reward += 1.0
 
