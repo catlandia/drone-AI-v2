@@ -40,6 +40,31 @@ Examples:
 
 Each `.pt` file is paired with a `.json` that stores the full metrics.
 
+FlyControl checkpoints are stored per curriculum stage:
+`models/flycontrol/{stage}/{filename}`. See
+[training.md](training.md#ui-curriculum-chain-warm-start).
+
+## Run log schema (`models/runs.csv`)
+
+Every training or evaluation run appends one row. Columns (in order):
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `timestamp_iso` | ISO 8601 | seconds precision, wall clock |
+| `date`          | `DD-MM-YYYY` | matches the model filename convention |
+| `minutes`       | float  | wall-clock training duration, 1 decimal |
+| `module`        | string | `flycontrol` / `pathfinder` / `perception` / `manager` / `adaptive` |
+| `stage`         | string | `hover` / `waypoint` / `delivery` / `delivery_route` / `deployment` / `eval` |
+| `best_score`    | float  | best numeric score observed in the run |
+| `avg_score`     | float  | mean score across the run |
+| `grade`         | string | letter tier (P..W) derived from `best_score` |
+| `updates`       | int    | PPO / gradient updates (0 for pure eval) |
+| `episodes`      | int    | episodes completed |
+| `run_tag`       | string | free-form tag for seed / config distinction |
+
+Appended by `drone_ai.grading.RunLogger`; consumed by the launcher's
+recent-runs strip. Schema constant: `RUN_LOG_FIELDS` in `grading.py`.
+
 ## Per-module criteria
 
 ### FlyControl

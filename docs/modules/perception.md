@@ -2,11 +2,34 @@
 
 **Layer 3** — obstacle detection and tracking.
 
+## Sub-models
+
+Perception is split into four sub-models, each graded independently
+under the P→W tier system:
+
+| Sub-model | File | Status | Purpose |
+|-----------|------|--------|---------|
+| Obstacles | `obstacles.py` | **landed** (wraps the shared noise model) | Generic obstacle detection + Kalman tracking |
+| Hazards   | `hazards.py`   | Phase 1 stub | Person / animal / vehicle / power line / water / other danger |
+| Targets   | `targets.py`   | Phase 1 stub | Base pad / drop marker / recipient marker / alt landing zone |
+| Agents    | `agents.py`    | Phase 1 stub | Other drones — Layer 8 visual mutual avoidance |
+
+Naming convention for saved checkpoints:
+`{Grade} {DD-MM-YYYY} perception-{kind} v{N}.pt`. Each sub-model has
+its own training curriculum and its own grade in `models/runs.csv`.
+
+The stubs return empty detection lists on Phase 1 — they exist so the
+orchestrator can import and call them today, and so their grading
+hooks are wired before Layer 8 lands.
+
 ## Files
 
-- `modules/perception/detector.py` — `PerceptionAI`, `Detection`
+- `modules/perception/detector.py` — shared noise model, `Detection` dataclass
 - `modules/perception/tracker.py` — `ObjectTracker` (Kalman filter)
-- `modules/perception/train.py` — benchmarking + grading
+- `modules/perception/obstacles.py` — Perception-Obstacles (active)
+- `modules/perception/hazards.py` — Perception-Hazards (stub)
+- `modules/perception/targets.py` — Perception-Targets (stub)
+- `modules/perception/agents.py` — Perception-Agents (stub, for Layer 8)
 
 ## Simulation vs real
 
