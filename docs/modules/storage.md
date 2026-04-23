@@ -4,6 +4,11 @@
 Benchmarked from the launcher's "Storage" card (writes synthetic
 rows, stress-tests tail-truncation + malformed-JSON tolerance).
 
+**Visual inspector:** `viz/inspector_storage.py` renders the 5-step
+stress pipeline as a diagram with pass/fail lights per check, plus
+a rolling event log so a regression in the reader is immediately
+visible. See [inspector_ui.md](../inspector_ui.md).
+
 Per-drone persistent log of everything Layer 5 learned during flight.
 
 ## Purpose

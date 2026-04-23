@@ -168,6 +168,44 @@ def _score_to_grade(score: float, thresholds: list) -> str:
     return "W"
 
 
+# Consistency weighting — how strongly the grade should punish a policy
+# that only nails it once in a thousand runs. A score that is great
+# once and bad the other 999 times is WORSE than a score that is
+# mediocre every single time, because deployment cares about the
+# expected per-mission outcome, not the outlier best.
+#
+# overall = AVG_WEIGHT * avg + BEST_WEIGHT * capped_best − STD_PENALTY * std
+#
+#   - AVG_WEIGHT = 0.9        → average dominates
+#   - BEST_WEIGHT = 0.1       → best is a tiny tiebreaker only
+#   - best is capped at avg + BEST_CAP so one lucky run can't shove the
+#     grade up; if best is already close to avg, the cap is a no-op
+#   - STD_PENALTY * std       → high variance is itself a red flag
+#     (usually means the policy is exploiting the reward surface on
+#     specific seeds and failing on others)
+CONSISTENCY_AVG_WEIGHT = 0.9
+CONSISTENCY_BEST_WEIGHT = 0.1
+CONSISTENCY_BEST_CAP = 50.0
+CONSISTENCY_STD_PENALTY = 0.5
+
+
+def consistency_score(best: float, avg: float, std: float = 0.0) -> float:
+    """Consistency-weighted overall score used to derive the letter grade.
+
+    Prefers policies that score OK every time over policies that score
+    great one-in-a-thousand — the latter are almost always reward-hacking
+    a single easy seed. See the constants above for the weights.
+
+    Per-episode `std` is optional; if omitted (e.g. a one-shot benchmark
+    like Pathfinder where best == avg by construction), the variance
+    penalty collapses to zero and the function just returns the mixed
+    best/avg.
+    """
+    capped_best = min(best, avg + CONSISTENCY_BEST_CAP)
+    mixed = CONSISTENCY_AVG_WEIGHT * avg + CONSISTENCY_BEST_WEIGHT * capped_best
+    return mixed - CONSISTENCY_STD_PENALTY * max(0.0, std)
+
+
 class ModelGrader:
     """Evaluates and grades any drone AI module."""
 
@@ -265,7 +303,9 @@ RUN_LOG_FIELDS = [
     "stage",          # hover / delivery / ... / eval
     "best_score",     # best numeric score observed in the run
     "avg_score",      # average score across the run
-    "grade",          # letter tier (P..W) derived from best_score
+    "std_score",      # stddev of episode scores (0 for single-shot benchmarks)
+    "overall_score",  # consistency-weighted score actually used for the grade
+    "grade",          # letter tier (P..W) derived from overall_score
     "updates",        # number of PPO/grad updates (or 0 for pure eval)
     "episodes",       # episodes completed
     "run_tag",        # free-form tag for seed/config distinction
@@ -284,9 +324,16 @@ class RunRecord:
     episodes: int = 0
     run_tag: str = ""
     timestamp: Optional[datetime] = None
+    std_score: float = 0.0
+    overall_score: Optional[float] = None  # None → computed from best/avg/std
 
     def to_row(self) -> Dict[str, str]:
         ts = self.timestamp or datetime.now()
+        overall = (
+            self.overall_score
+            if self.overall_score is not None
+            else consistency_score(self.best_score, self.avg_score, self.std_score)
+        )
         return {
             "timestamp_iso": ts.isoformat(timespec="seconds"),
             "date":          ts.strftime("%d-%m-%Y"),
@@ -295,6 +342,8 @@ class RunRecord:
             "stage":          self.stage,
             "best_score":    f"{self.best_score:.2f}",
             "avg_score":     f"{self.avg_score:.2f}",
+            "std_score":     f"{self.std_score:.2f}",
+            "overall_score": f"{overall:.2f}",
             "grade":         self.grade,
             "updates":       str(self.updates),
             "episodes":      str(self.episodes),
@@ -314,12 +363,36 @@ class RunLogger:
 
     def append(self, record: RunRecord) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._migrate_header_if_needed()
         exists = os.path.isfile(self.path)
         with open(self.path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS)
             if not exists:
                 w.writeheader()
             w.writerow(record.to_row())
+
+    def _migrate_header_if_needed(self) -> None:
+        """If runs.csv exists with an older header (pre-consistency
+        scoring), rewrite it in-place with the new columns, filling
+        missing cells with empty strings. Keeps historical rows visible
+        so the user can still see trend deltas after the grading change.
+        """
+        if not os.path.isfile(self.path):
+            return
+        with open(self.path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return
+            if header == RUN_LOG_FIELDS:
+                return
+            rows = list(csv.DictReader(open(self.path, "r", newline="", encoding="utf-8")))
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=RUN_LOG_FIELDS)
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in RUN_LOG_FIELDS})
 
     def read_all(self) -> List[Dict[str, str]]:
         if not os.path.isfile(self.path):

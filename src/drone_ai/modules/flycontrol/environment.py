@@ -216,36 +216,52 @@ class FlyControlEnv(gym.Env):
         if obs_dist < 0.5:
             reward -= 10.0 * (0.5 - obs_dist)
 
+        # --- Reward-hacking guards --------------------------------------
+        # Targets for every task sit at z ≥ 5 m (hover/delivery have
+        # target_z = 5..20 m, waypoints z = 3..30 m). A drone that soft-
+        # lands directly under the target is still within the 20 m
+        # distance band and would otherwise farm shaping forever. Gate
+        # distance-shaping on the drone actually FLYING: airborne and
+        # roughly upright. Pickup/dropzone triggers fire regardless so
+        # legitimate touchdowns still work.
+        airborne = pos[2] > 0.3
+        upright = (
+            abs(state.orientation[0]) < np.pi / 3
+            and abs(state.orientation[1]) < np.pi / 3
+        )
+        can_shape = airborne and upright
+
         if self.task == TaskType.HOVER:
-            # Two-band approach: a faint gradient all the way out to
-            # 20m so PPO has a learning signal while the drone is
-            # still flying toward the target, plus a steep on-target
-            # bonus so a well-trained hover still converges and caps
-            # out near the PD-teacher reference. Was zero beyond 2m
-            # before, which left PPO without useful gradient over the
-            # entire approach phase.
-            reward += max(0.0, 0.5 * (1.0 - dist / 20.0))
-            if dist < 2.0:
-                reward += max(0.0, 2.0 - dist) * 0.5
-            if dist < 0.3:
-                reward += 1.0
+            # Two-band shaping, gated on can_shape so a grounded drone
+            # earns zero and must re-launch to score. Far-band
+            # coefficient reduced (0.5 → 0.3) so even in the air the
+            # far band can't accumulate into an exploitable pile.
+            if can_shape:
+                reward += max(0.0, 0.3 * (1.0 - dist / 20.0))
+                if dist < 2.0:
+                    reward += max(0.0, 2.0 - dist) * 0.5
+                if dist < 0.3:
+                    reward += 1.0
 
         elif self.task == TaskType.DELIVERY:
             if not self.carrying:
-                reward += max(0.0, 3.0 - dist) * 0.3
+                if can_shape:
+                    reward += max(0.0, 3.0 - dist) * 0.3
                 if dist < 1.0:
                     self.carrying = True
                     self.target = self.dropzone.copy()
                     self.target[2] = 5.0
                     reward += 5.0
             else:
-                reward += max(0.0, 3.0 - dist) * 0.3
+                if can_shape:
+                    reward += max(0.0, 3.0 - dist) * 0.3
                 if dist < 1.5:
                     reward += 50.0
                     done = True
 
         elif self.task in (TaskType.DELIVERY_ROUTE, TaskType.DEPLOYMENT):
-            reward += max(0.0, 5.0 - dist) * 0.1
+            if can_shape:
+                reward += max(0.0, 5.0 - dist) * 0.1
             if dist < 2.0:
                 reward += 30.0
                 self.deliveries_done += 1
@@ -256,7 +272,21 @@ class FlyControlEnv(gym.Env):
                 else:
                     self.target = self.waypoints[self.waypoint_idx].copy()
 
-        reward -= 0.01  # time penalty
+        # Idle-on-ground penalty — discourages the "soft-land and wait
+        # it out" exploit. The crash model intentionally allows soft
+        # touchdowns so the drone can actually land, but a grounded
+        # drone that isn't completing a delivery is idling on purpose.
+        at_delivery_touchdown = (
+            self.task == TaskType.DELIVERY and self.carrying and dist < 1.5
+        )
+        if not airborne and not at_delivery_touchdown:
+            reward -= 0.02
+
+        # Time penalty. Raised from -0.01 to -0.02 so pure survival is
+        # net-negative unless the policy is actually earning shaping —
+        # otherwise a drone that just hovers in-bounds forever grades
+        # higher than one that occasionally nails the task.
+        reward -= 0.02
 
         return reward, done
 

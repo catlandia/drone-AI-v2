@@ -4,6 +4,13 @@
 (`plan.py`, `coordinator.py`). Benchmarked from the launcher's
 "Swarm" card against a hand-written right-of-way spec.
 
+**Visual inspector:** `viz/inspector_swarm.py` draws a top-down
+scene per trial — drones coloured by mission class, avoidance
+radius, incoming contact, and the coordinator's chosen action as a
+coloured ring around the self drone. Match vs expected action is
+printed in green (match) or red (mismatch). See
+[inspector_ui.md](../inspector_ui.md).
+
 Multi-drone coordination with **zero radio comms after takeoff**.
 
 ## Core rule

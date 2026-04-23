@@ -30,6 +30,10 @@ hooks are wired before Layer 8 lands.
 - `modules/perception/hazards.py` — Perception-Hazards (stub)
 - `modules/perception/targets.py` — Perception-Targets (stub)
 - `modules/perception/agents.py` — Perception-Agents (stub, for Layer 8)
+- `viz/inspector_perception.py` — visual inspector that shows
+  detections vs ground-truth, false positives, and misses per frame.
+  See [inspector_ui.md](../inspector_ui.md). The future CNN swap-in
+  is sketched in [future_image_training.md](../future_image_training.md).
 
 ## Simulation vs real
 

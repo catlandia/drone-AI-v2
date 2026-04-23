@@ -55,3 +55,12 @@ that plan.
 ## Experiments + history
 
 - [`experiments.md`](experiments.md) — grade-mixing experiments.
+
+## Future work (not implemented)
+
+- [`future_image_training.md`](future_image_training.md) — plan for
+  self-building a perception dataset by scraping the web,
+  filename-labelling, and CNN-training offline. Replaces the Phase 1
+  noise-simulated perception when the time comes.
+- [`inspector_ui.md`](inspector_ui.md) — how the visual inspectors
+  work, what each pane shows, and the keyboard shortcuts.

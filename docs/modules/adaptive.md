@@ -4,6 +4,12 @@
 (`learner.py`, `warden.py`, `rollback.py`, `soft_bounds.py`).
 Benchmarked from the launcher's "Adaptive" card.
 
+**Visual inspector:** `viz/inspector_adaptive.py` runs the same
+baseline-vs-adapted comparison with side-by-side per-episode reward
+bars so the user can see the online learner close (or not close)
+the gap on a perturbed environment. See
+[inspector_ui.md](../inspector_ui.md).
+
 Online learning of every other layer, and of itself. Every update
 is guarded.
 

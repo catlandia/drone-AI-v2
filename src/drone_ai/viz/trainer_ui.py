@@ -18,6 +18,7 @@ import os
 from drone_ai.grading import (
     RunLogger, RunRecord, score_to_flycontrol_grade,
     generate_model_name, next_version, parse_model_name,
+    consistency_score,
 )
 from drone_ai.modules.flycontrol.agent import PPOAgent, PPOConfig
 from drone_ai.modules.flycontrol.environment import (
@@ -273,9 +274,11 @@ class TrainerUI:
         clicks / closes the window. Lets them read the final grade
         before returning to the launcher."""
         from drone_ai.grading import GRADE_NAMES, GRADE_DESCRIPTIONS
-        avg = (sum(self.recent_rewards) / len(self.recent_rewards)) if self.recent_rewards else 0.0
+        avg = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
+        std = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        grade = score_to_flycontrol_grade(best) if self.best_ep_reward != -float("inf") else "—"
+        overall = consistency_score(best, avg, std) if self._all_rewards else 0.0
+        grade = score_to_flycontrol_grade(overall) if self._all_rewards else "—"
         minutes = (time.monotonic() - self._start_time) / 60.0
         is_test = self.cfg.test_run or not self.base_model_name
         title = (
@@ -289,8 +292,10 @@ class TrainerUI:
              "dim"),
             ("", "dim"),
             (f"Grade:    {grade}  ({GRADE_NAMES.get(grade,'')})", "accent"),
-            (f"Best R:   {best:+.1f}", "text"),
+            (f"Overall:  {overall:+.1f}   (consistency-weighted, drives the grade)", "text"),
             (f"Avg R:    {avg:+.1f}", "text"),
+            (f"Std R:    {std:.1f}   (lower = more consistent)", "text"),
+            (f"Best R:   {best:+.1f}   (tiebreaker only)", "dim"),
             (f"Updates:  {self.update_idx}/{self.cfg.total_updates}", "text"),
             (f"Episodes: {self.episode_idx}", "text"),
             (f"Time:     {minutes:.1f} min", "text"),
@@ -321,16 +326,28 @@ class TrainerUI:
         models_root = os.path.dirname(self.cfg.log_path) or "models"
         stage_dir = flycontrol_stage_dir(models_root, self.cfg.stage)
         os.makedirs(stage_dir, exist_ok=True)
-        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        grade = score_to_flycontrol_grade(best)
+        grade = self._current_grade()
         version = next_version(stage_dir, "flycontrol")
         return os.path.join(stage_dir, generate_model_name(grade, "flycontrol", version))
+
+    def _current_grade(self) -> str:
+        """Grade from the consistency-weighted overall score, not raw best.
+        Keeps a policy from earning an S-tier filename on the strength of
+        one freak episode when the other 999 tumbled."""
+        if not self._all_rewards:
+            return score_to_flycontrol_grade(0.0)
+        avg = float(np.mean(self._all_rewards))
+        std = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
+        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else avg
+        return score_to_flycontrol_grade(consistency_score(best, avg, std))
 
     def _log_run(self) -> None:
         minutes = (time.monotonic() - self._start_time) / 60.0
         avg = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
+        std = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        grade = score_to_flycontrol_grade(best)
+        overall = consistency_score(best, avg, std) if self._all_rewards else 0.0
+        grade = score_to_flycontrol_grade(overall) if self._all_rewards else score_to_flycontrol_grade(0.0)
         # A fresh-base run (test_run or no base_model_name) is tagged
         # "test" so the runs.csv reader can filter it out when comparing
         # real curriculum steps.
@@ -343,6 +360,8 @@ class TrainerUI:
             stage=self.cfg.stage,
             best_score=best,
             avg_score=avg,
+            std_score=std,
+            overall_score=overall,
             grade=grade,
             minutes=minutes,
             updates=self.update_idx,
@@ -450,9 +469,16 @@ class TrainerUI:
     # ------------------------------------------------------------------
 
     def _render_frame(self):
-        avg = (sum(self.recent_rewards) / len(self.recent_rewards)) if self.recent_rewards else 0.0
+        avg_recent = (sum(self.recent_rewards) / len(self.recent_rewards)) if self.recent_rewards else 0.0
+        avg_all = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
+        std_all = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
         best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        grade = score_to_flycontrol_grade(best) if self.best_ep_reward != -float("inf") else "—"
+        overall = (
+            consistency_score(best, avg_all, std_all) if self._all_rewards else 0.0
+        )
+        grade = (
+            score_to_flycontrol_grade(overall) if self._all_rewards else "—"
+        )
         minutes = (time.monotonic() - self._start_time) / 60.0
         metrics = [
             ("update",  f"{self.update_idx}/{self.cfg.total_updates}", None),
@@ -460,7 +486,9 @@ class TrainerUI:
             ("episode", str(self.episode_idx), None),
             ("ep step", str(self.ep_len), None),
             ("ep R",    f"{self.ep_reward:+.1f}", None),
-            ("avg R",   f"{avg:+.1f}", None),
+            ("avg R",   f"{avg_recent:+.1f}", None),
+            ("std R",   f"{std_all:.1f}", None),
+            ("overall", f"{overall:+.1f}" if self._all_rewards else "—", None),
             ("best R",  f"{best:+.1f}"
                         if self.best_ep_reward != -float("inf") else "—", None),
             ("grade",   grade, None),

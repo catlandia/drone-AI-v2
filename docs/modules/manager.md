@@ -5,7 +5,10 @@
 ## Files
 
 - `modules/manager/planner.py` — `MissionPlanner`, `DeliveryRequest`
-- `modules/manager/train.py` — benchmarking + grading
+- `modules/manager/train.py` — benchmarking + grading (terminal)
+- `viz/inspector_manager.py` — visual inspector showing the mission
+  queue, priority colours, and the chosen visit order per trial.
+  See [inspector_ui.md](../inspector_ui.md).
 
 ## Responsibilities
 

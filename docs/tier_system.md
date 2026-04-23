@@ -55,15 +55,38 @@ Every training or evaluation run appends one row. Columns (in order):
 | `minutes`       | float  | wall-clock training duration, 1 decimal |
 | `module`        | string | `flycontrol` / `pathfinder` / `perception` / `manager` / `adaptive` |
 | `stage`         | string | `hover` / `waypoint` / `delivery` / `delivery_route` / `deployment` / `eval` |
-| `best_score`    | float  | best numeric score observed in the run |
+| `best_score`    | float  | best numeric score observed in the run (tiebreaker only) |
 | `avg_score`     | float  | mean score across the run |
-| `grade`         | string | letter tier (P..W) derived from `best_score` |
+| `std_score`     | float  | stddev of per-episode scores (0 on one-shot benchmarks) |
+| `overall_score` | float  | consistency-weighted score that DRIVES the grade |
+| `grade`         | string | letter tier (P..W) derived from `overall_score` |
 | `updates`       | int    | PPO / gradient updates (0 for pure eval) |
 | `episodes`      | int    | episodes completed |
 | `run_tag`       | string | free-form tag for seed / config distinction |
 
 Appended by `drone_ai.grading.RunLogger`; consumed by the launcher's
 recent-runs strip. Schema constant: `RUN_LOG_FIELDS` in `grading.py`.
+Older `runs.csv` files (pre-consistency-scoring) are migrated in place
+on the next append — old rows keep their original values, the new
+columns are left blank for history.
+
+## Overall score — consistency weighting
+
+`overall_score = 0.9·avg + 0.1·min(best, avg+50) − 0.5·std`
+
+The overall score is what the grade comes from. Rationale: a policy
+that nails one episode in a thousand and fails the other 999 is worse
+than one that scores OK every time. Heavy weight on the average, tiny
+weight on the best, explicit stddev penalty so a wildly oscillating
+policy can't grade well just because its mean drifts up. Best is
+capped at `avg + 50` so one lucky seed can't hoist the grade into a
+higher tier on its own.
+
+Constants live in `grading.py` (`CONSISTENCY_AVG_WEIGHT`,
+`CONSISTENCY_BEST_WEIGHT`, `CONSISTENCY_BEST_CAP`,
+`CONSISTENCY_STD_PENALTY`). One-shot benchmarks (Pathfinder, Manager
+heuristic) pass `std=0`; the formula collapses to `0.9·avg + 0.1·best`
+which equals the input score when best == avg.
 
 ## Per-module criteria
 

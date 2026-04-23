@@ -58,6 +58,12 @@ def main():
     p_st.add_argument("drone_id", help="Drone id whose log to summarize")
     p_st.add_argument("--root", default="logs/storage")
 
+    # launch — open the visual launcher (primary entry point for users)
+    sub.add_parser(
+        "launch",
+        help="Open the visual launcher (inspect every module in its own window)",
+    )
+
     # personality — Layer 7 export / inspect
     p_pers = sub.add_parser("personality",
                             help="Export or inspect a Layer 7 personality artifact")
@@ -89,6 +95,9 @@ def main():
         _run_storage(args)
     elif args.command == "personality":
         _run_personality(args)
+    elif args.command == "launch":
+        from drone_ai.viz.launcher import Launcher
+        Launcher().run()
 
 
 def _run_train(args):

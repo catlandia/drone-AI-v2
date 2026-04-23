@@ -5,7 +5,9 @@
 ## Files
 
 - `modules/pathfinder/algorithms.py` — `AStarPlanner`, `RRTPlanner`, `PathPlanner`
-- `modules/pathfinder/train.py` — benchmark-based grading
+- `modules/pathfinder/train.py` — benchmark-based grading (terminal)
+- `viz/inspector_pathfinder.py` — visual inspector (top-down grid +
+  start/goal/path per trial). See [inspector_ui.md](../inspector_ui.md).
 
 ## Algorithms
 

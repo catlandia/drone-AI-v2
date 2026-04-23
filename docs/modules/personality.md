@@ -5,6 +5,11 @@ Benchmarked from the launcher's "Personality" card (applies the
 exported delta to noisy sibling baselines and measures recovery
 residual).
 
+**Visual inspector:** `viz/inspector_personality.py` renders the
+5-step export→apply pipeline as a diagram and plots per-sibling
+residuals as a colour-coded bar chart (green < 0.5 good,
+amber < 1.0, red ≥ 1.0). See [inspector_ui.md](../inspector_ui.md).
+
 Transferable artifact encapsulating a drone's learned personality —
 the weight + hyperparameter subset that made it good.
 

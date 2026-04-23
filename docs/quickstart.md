@@ -14,7 +14,23 @@ pip install -e ".[train]"   # tensorboard + stable-baselines3
 pip install -e ".[all]"     # everything
 ```
 
-## 2. Run the demo
+## 2. Open the launcher (recommended first step)
+
+Every module has a visual inspector now — no terminal staring.
+Launch the menu:
+
+```bash
+drone-ai launch     # or: python -m drone_ai.viz.launcher
+```
+
+Pick any card (Pathfinder, Perception, Manager, Swarm, Storage,
+Personality, Adaptive, or a FlyControl stage). The inspector opens
+in its own window with top-down views, pipeline diagrams, live
+metrics, and pass/fail indicators. Keyboard: **Space** play/pause,
+**→** step, **+/−** speed, **Esc** close. Details in
+[inspector_ui.md](inspector_ui.md).
+
+## 3. Run the demo
 
 No training required — this uses an untrained agent + PD controller fallback:
 

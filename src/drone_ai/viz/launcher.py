@@ -211,17 +211,22 @@ def _scan_checkpoints(base_dirs: List[str]) -> List[Tuple[str, str]]:
 # ---- Per-card runner ------------------------------------------------------
 
 def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> None:
-    """Execute the work for a card. FlyControl stages open the live
-    3D trainer (own window); other cards run inline in the calling
-    thread and write to stdout. The launcher wraps non-FlyControl
-    calls in a worker thread + redirected stdout so the launcher
-    window can render a progress panel concurrently.
+    """Execute the work for a card.
 
-    A missing `base_path` means the user picked "(fresh)" in the
-    picker. We propagate that as `run_tag="test"` so runs.csv rows
-    coming out of a fresh launch are distinguishable from real
-    curriculum steps — useful when the chain is empty and the user
-    just wants to exercise the training machinery.
+    Every card now opens its own full-screen inspector so the user can
+    actually SEE what the module is doing — nothing is terminal-only.
+    Each inspector:
+      - Owns its own pygame display (created after the launcher tears
+        down its window — see `_launch_selected`).
+      - Runs the same underlying benchmark/training logic as before,
+        so the same .pt checkpoints + runs.csv rows still get
+        produced.
+      - Shows its own final-results modal before returning. The
+        launcher then re-creates its window and returns to MENU.
+
+    The non-UI command-line entry points (`modules/*/train.py::main`)
+    still exist for batch/CI use, but interactive launches always go
+    through the inspector path now.
     """
     is_test = base_path is None
     tag = "test" if is_test else ""
@@ -239,29 +244,26 @@ def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> 
         return
 
     if card.key == "manager":
-        from drone_ai.modules.manager.train import run_training
-        run_training(grade="P", trials=20, save_dir="models/manager", run_tag=tag)
+        from drone_ai.viz.inspector_manager import run_manager_inspector
+        run_manager_inspector(grade="P", trials=20, run_tag=tag)
     elif card.key == "pathfinder":
-        from drone_ai.modules.pathfinder.train import run_training
-        run_training(trials=30, save_dir="models/pathfinder", run_tag=tag)
+        from drone_ai.viz.inspector_pathfinder import run_pathfinder_inspector
+        run_pathfinder_inspector(trials=30, run_tag=tag)
     elif card.key == "perception":
-        from drone_ai.modules.perception.train import run_training, run_submodels
-        run_training(grade="P", trials=80, save_dir="models/perception", run_tag=tag)
-        run_submodels(grade="P", trials=40, save_dir="models/perception")
+        from drone_ai.viz.inspector_perception import run_perception_inspector
+        run_perception_inspector(grade="P", trials=30, run_tag=tag)
     elif card.key == "adaptive":
-        from drone_ai.modules.adaptive.train import run_training
-        run_training(model_path=base_path, episodes=15, save_dir="models/adaptive", run_tag=tag)
+        from drone_ai.viz.inspector_adaptive import run_adaptive_inspector
+        run_adaptive_inspector(episodes=6, model_path=base_path, run_tag=tag)
     elif card.key == "storage":
-        from drone_ai.modules.storage.train import run_training
-        run_training(n_missions=60, save_dir="models/storage", run_tag=tag)
+        from drone_ai.viz.inspector_storage import run_storage_inspector
+        run_storage_inspector(n_missions=60, run_tag=tag)
     elif card.key == "personality":
-        from drone_ai.modules.personality.train import run_training
-        # The personality benchmark looks up the newest checkpoint
-        # internally; base_path is informational for this card.
-        run_training(save_dir="models/personality", run_tag=tag)
+        from drone_ai.viz.inspector_personality import run_personality_inspector
+        run_personality_inspector(n_siblings=5, run_tag=tag)
     elif card.key == "swarm":
-        from drone_ai.modules.swarm.train import run_training
-        run_training(trials=800, n_drones=4, save_dir="models/swarm", run_tag=tag)
+        from drone_ai.viz.inspector_swarm import run_swarm_inspector
+        run_swarm_inspector(trials=40, n_drones=4, run_tag=tag)
     elif card.key == "demo":
         _run_demo(base_path)
     else:
@@ -489,39 +491,22 @@ class Launcher:
             return
         _, path = self._picker_options[self._picker_idx]
 
-        if card.section == "flycontrol":
-            # FlyControl stages open their own window; we don't run
-            # them in a worker thread. Tear down the launcher window
-            # while the trainer owns the display, then come back.
-            is_test = path is None
-            pygame.display.quit()
-            try:
-                cfg = TrainConfig(
-                    stage=card.key,
-                    total_updates=self.total_updates,
-                    warm_start_path=path,
-                    hold_on_finish=True,
-                    test_run=is_test,
-                    run_tag="test" if is_test else "",
-                )
-                TrainerUI(cfg).run()
-            except Exception as e:
-                print(f"[launcher] FlyControl '{card.key}' raised: {e}")
-                traceback.print_exc()
-            finally:
-                self._init_pygame()
-                self._refresh_strip()
-                # FlyControl trainer has its own results screen, so we
-                # come straight back to MENU rather than RESULTS.
-                self.state = LauncherState.MENU
-            return
-
-        # Non-FlyControl: spawn a worker, switch to RUNNING.
-        self._worker = BenchmarkWorker(card, path, self.total_updates)
-        self._run_t0 = time.monotonic()
-        self._results_card = card
-        self.state = LauncherState.RUNNING
-        self._worker.start()
+        # Every card opens its own inspector window (the launcher used
+        # to stream terminal output for non-FlyControl cards; that's
+        # gone now because the user asked for a proper UI on every
+        # module). Tear down the launcher display, run the card, then
+        # re-init and come back to MENU. Each inspector shows its own
+        # results modal so we don't need the launcher's RESULTS state.
+        pygame.display.quit()
+        try:
+            _run_card(card, path, self.total_updates)
+        except Exception as e:
+            print(f"[launcher] card '{card.key}' raised: {e}")
+            traceback.print_exc()
+        finally:
+            self._init_pygame()
+            self._refresh_strip()
+            self.state = LauncherState.MENU
 
     # ---- Runner tick ----------------------------------------------------
 
@@ -562,11 +547,15 @@ class Launcher:
             grade = latest.get("grade", "—")
             best = latest.get("best_score", "—")
             avg = latest.get("avg_score", "—")
+            std = latest.get("std_score", "—")
+            overall = latest.get("overall_score", "—")
             stage = latest.get("stage", "—")
             tag = latest.get("run_tag", "")
             lines.append((f"Grade: {grade}", "accent"))
-            lines.append((f"Best score: {best}", "text"))
+            lines.append((f"Overall:    {overall}   (drives the grade)", "text"))
             lines.append((f"Avg score:  {avg}", "text"))
+            lines.append((f"Std score:  {std}", "text"))
+            lines.append((f"Best score: {best}   (tiebreaker only)", "dim"))
             lines.append((f"Stage:      {stage}", "text"))
             if tag:
                 lines.append((f"Tag:        {tag}", "dim"))
@@ -722,7 +711,7 @@ class Launcher:
                 (lx, ly),
             )
         else:
-            header = f"  {'date':<12}{'module':<13}{'stage':<16}{'grade':<6}{'best':>8}{'min':>6}"
+            header = f"  {'date':<12}{'module':<13}{'stage':<16}{'grade':<6}{'avg':>8}{'std':>7}{'best':>8}{'min':>6}"
             self.screen.blit(self.font_sm.render(header, True, TEXT_DIM), (lx, ly))
             ly += 14
             for row in self._recent_runs:
@@ -731,6 +720,8 @@ class Launcher:
                     f"{row.get('module',''):<13}"
                     f"{row.get('stage',''):<16}"
                     f"{row.get('grade',''):<6}"
+                    f"{row.get('avg_score',''):>8}"
+                    f"{row.get('std_score',''):>7}"
                     f"{row.get('best_score',''):>8}"
                     f"{row.get('minutes',''):>6}"
                 )

@@ -37,13 +37,18 @@ The launcher opens with cards grouped by section:
 - **FlyControl Curriculum (Layer 4)** — hover → waypoint → delivery →
   delivery_route → deployment. Each stage opens a live 3D training window
   and warm-starts from the previous stage's latest checkpoint.
-- **Module Benchmarks (Layers 1, 2, 3, 5)** — run headless in a worker
-  thread with live stdout streamed into the launcher window. Each
-  writes a tier-named `.pt` under `models/<layer>/` and a row to
-  `models/runs.csv`.
+- **Module Benchmarks (Layers 1, 2, 3, 5)** — each opens its own
+  **visual inspector window** (top-down world views, live metric
+  sidebars, step/auto-play controls) so you can actually see what
+  the module does per trial. Writes a tier-named `.pt` under
+  `models/<layer>/` and a row to `models/runs.csv`.
 - **Phase 2 Ops (Layers 6, 7, 8) + Demo** — Storage field-log stress
   test, Personality export + sibling-transfer test, Swarm coordinator
-  correctness benchmark, and the PD-controller free-fly demo.
+  correctness benchmark, and the PD-controller free-fly demo. Each
+  has a visual inspector; structure + thinking diagrams for the
+  modules without a natural world view.
+
+Full inspector reference: [`docs/inspector_ui.md`](docs/inspector_ui.md).
 
 Click a card to open the **pre-launch picker**, pick a warm-start
 base (`(fresh)`, `(auto — newest)`, or any specific checkpoint), then
@@ -70,7 +75,8 @@ At end of training the results modal waits for input — nothing auto-exits.
 
 ```bash
 pip install -e .
-drone-ai-app                          # launch the visual app
+drone-ai launch                       # visual launcher (cards → inspectors)
+drone-ai-app                          # same thing via the GUI wrapper
 drone-ai demo                         # headless demo mission
 
 # Phase 1 — Layers 1-4

@@ -24,7 +24,8 @@ except ImportError:
 from drone_ai.modules.flycontrol.environment import FlyControlEnv, TaskType, OBS_DIM
 from drone_ai.modules.flycontrol.agent import PPOAgent, PPOConfig
 from drone_ai.grading import (
-    ModelGrader, FlyControlMetrics, generate_model_name, next_version
+    ModelGrader, FlyControlMetrics, generate_model_name, next_version,
+    consistency_score,
 )
 
 STAGES = [
@@ -39,18 +40,34 @@ EVAL_MAX_STEPS = 1000
 
 
 def evaluate_agent(agent: PPOAgent, task: TaskType, difficulty: float, rand: bool) -> float:
+    """Evaluate a policy and return a consistency-weighted score.
+
+    Prior version returned the plain mean across EVAL_EPISODES, which
+    let one freak episode (e.g. 500 reward) drag the reported score up
+    while the other four earned zero. We now weight the average heavily,
+    cap the best-episode contribution, and subtract a stddev penalty —
+    a policy that delivers OK results EVERY episode beats one that hits
+    an outlier once in five.
+    """
     env = FlyControlEnv(task=task, difficulty=difficulty, domain_randomization=rand)
-    total = 0.0
+    ep_rewards = []
     for ep in range(EVAL_EPISODES):
         obs, _ = env.reset(seed=ep * 7)
+        r_sum = 0.0
         for _ in range(EVAL_MAX_STEPS):
             action, _ = agent.select_action(obs, deterministic=True)
             obs, r, term, trunc, _ = env.step(action)
-            total += r
+            r_sum += r
             if term or trunc:
                 break
+        ep_rewards.append(r_sum)
     env.close()
-    return total / EVAL_EPISODES
+    if not ep_rewards:
+        return 0.0
+    avg = float(np.mean(ep_rewards))
+    std = float(np.std(ep_rewards)) if len(ep_rewards) > 1 else 0.0
+    best = float(np.max(ep_rewards))
+    return consistency_score(best, avg, std)
 
 
 def train_stage(
