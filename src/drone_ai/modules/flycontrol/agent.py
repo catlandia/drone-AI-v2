@@ -206,17 +206,24 @@ class PPOAgent:
         lr: float = 1e-3,
         progress_cb=None,
         post_log_std: Optional[float] = -2.2,
+        rewards: Optional[np.ndarray] = None,
+        dones: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
         """Supervised pre-training of the actor on (obs, expert_action)
-        pairs — Behavior Cloning from a PD controller.
+        pairs — Behavior Cloning from a PD controller — and, when
+        `rewards` + `dones` are provided, the critic on Monte Carlo
+        returns from the same rollouts.
 
         PLAN.md §8 / §18: fresh PPO tumbles the drone in a handful of
         steps. BC warm-up hands the actor a decent starting policy so
         PPO has something to refine instead of something to survive.
 
-        Only the actor mean is updated (shared layers + actor_mean
-        head). Critic is left alone — it's warmed up implicitly by
-        the first PPO rollout.
+        Critic warm-up matters in shallow per-drone budgets (population
+        mode): without it the value function is random for the first
+        ~10 PPO updates, advantage estimates are noise, and the policy
+        drifts before the critic catches up. Training V(s) → Σ γ^k r_k
+        on the same PD rollouts gives PPO a calibrated baseline from
+        update 1.
 
         After BC, `log_std` is clamped down to `post_log_std`
         (default −2.2, so σ ≈ 0.11) so the stochastic policy doesn't
@@ -262,13 +269,56 @@ class PPOAgent:
                 except Exception:
                     pass
 
+        # --- Critic warm-up ----------------------------------------------
+        # Compute Monte Carlo discounted returns from the PD rollout's
+        # reward stream. The returns are reset at episode boundaries
+        # (where dones == True) so cross-episode bootstrapping doesn't
+        # leak into the targets.
+        critic_loss = float("nan")
+        if rewards is not None and dones is not None and len(rewards) == n:
+            rew_np = np.asarray(rewards, dtype=np.float32)
+            done_np = np.asarray(dones, dtype=np.bool_)
+            returns = np.zeros(n, dtype=np.float32)
+            running = 0.0
+            for t in range(n - 1, -1, -1):
+                if done_np[t]:
+                    running = 0.0
+                running = float(rew_np[t]) + self.config.gamma * running
+                returns[t] = running
+            ret_t = torch.from_numpy(returns).float().to(self.device)
+
+            critic_params = list(self.policy.shared.parameters()) + \
+                            list(self.policy.critic.parameters())
+            crit_opt = optim.Adam(critic_params, lr=lr)
+            for epoch in range(n_epochs):
+                idx = torch.randperm(n, device=self.device)
+                losses = []
+                for start in range(0, n, batch_size):
+                    b = idx[start:start + batch_size]
+                    h = self.policy.shared(obs_t[b])
+                    v = self.policy.critic(h).squeeze(-1)
+                    loss = F.mse_loss(v, ret_t[b])
+                    crit_opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        critic_params, self.config.max_grad_norm
+                    )
+                    crit_opt.step()
+                    losses.append(loss.item())
+                critic_loss = float(np.mean(losses)) if losses else float("nan")
+
         # Tighten exploration noise so the BC-learned policy isn't
         # drowned by sigma on the first stochastic rollouts.
         if post_log_std is not None:
             with torch.no_grad():
                 self.policy.actor_log_std.fill_(float(post_log_std))
 
-        return {"loss": last_loss, "epochs": n_epochs, "samples": int(n)}
+        return {
+            "loss": last_loss,
+            "critic_loss": critic_loss,
+            "epochs": n_epochs,
+            "samples": int(n),
+        }
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

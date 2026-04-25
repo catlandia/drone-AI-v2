@@ -82,29 +82,44 @@ def collect_pd_rollouts(
     n_episodes: int = 10,
     max_steps: int = 1500,
     seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Run the PD controller in `env` for `n_episodes` and return the
-    collected observation/action pairs as a supervised dataset.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Run the PD controller in `env` for `n_episodes` and return a
+    supervised dataset of (obs, action, reward, done).
 
-    The observations are the env's 25-D vector as-seen by the PPO
+    The observations are the env's 25-D vector as seen by the PPO
     actor (normalized), and the actions are the PD controller's
-    outputs in [0,1]^4 — identical action space to the policy.
+    outputs in [0,1]^4 — identical action space to the policy. The
+    reward + done streams come back so the critic can be warmed up
+    against Monte Carlo returns at the same time the actor is BC-
+    trained on the action targets.
     """
     obs_buf: List[np.ndarray] = []
     act_buf: List[np.ndarray] = []
+    rew_buf: List[float] = []
+    done_buf: List[bool] = []
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=seed + ep)
         for _ in range(max_steps):
             action = pd_action(env.physics.state, env.target, env.physics)
             obs_buf.append(obs.copy())
             act_buf.append(action.copy())
-            obs, _, term, trunc, _ = env.step(action)
-            if term or trunc:
+            obs, reward, term, trunc, _ = env.step(action)
+            done = bool(term or trunc)
+            rew_buf.append(float(reward))
+            done_buf.append(done)
+            if done:
                 break
     if not obs_buf:
         # Degenerate case — return empty arrays with the correct shapes.
         return (
             np.zeros((0, env.observation_space.shape[0]), dtype=np.float32),
             np.zeros((0, env.action_space.shape[0]), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.bool_),
         )
-    return np.asarray(obs_buf, dtype=np.float32), np.asarray(act_buf, dtype=np.float32)
+    return (
+        np.asarray(obs_buf, dtype=np.float32),
+        np.asarray(act_buf, dtype=np.float32),
+        np.asarray(rew_buf, dtype=np.float32),
+        np.asarray(done_buf, dtype=np.bool_),
+    )

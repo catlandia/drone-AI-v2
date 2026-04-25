@@ -180,7 +180,13 @@ class TrainConfig:
     # of the top half. 0 disables mid-run evolution — population just
     # trains in parallel and the best-of-N is saved at the end. Only
     # has effect when population > 1.
-    evolve_every: int = 25
+    #
+    # Bumped from 25 to 50: at 25 each drone only had ~8-10 episodes
+    # between culls, and ranking on a 20-episode recent window with
+    # such few samples meant fitness was dominated by single-episode
+    # luck. Selection oscillated, the leader kept changing, and grades
+    # bounced around the noise floor instead of climbing.
+    evolve_every: int = 50
     # Per-drone PPO buffer-size jitter. Each drone gets
     # `steps_per_update + i * stagger_steps` so their PPO updates fire
     # on different ticks instead of all clumping on the same frame.
@@ -687,13 +693,13 @@ class TrainerUI:
         self._bc_status = "Collecting PD rollouts…"
         self._render_frame()
         self.renderer.flip()
-        pd_obs, pd_acts = collect_pd_rollouts(
+        pd_obs, pd_acts, pd_rews, pd_dones = collect_pd_rollouts(
             seed_drone.env,
             n_episodes=self.cfg.bc_episodes,
             max_steps=1500,
             seed=self.cfg.seed,
         )
-        print(f"[bc] collected {len(pd_obs)} (obs, act) pairs from "
+        print(f"[bc] collected {len(pd_obs)} (obs, act, r, done) pairs from "
               f"{self.cfg.bc_episodes} PD episodes")
 
         if len(pd_obs) == 0:
@@ -724,8 +730,13 @@ class TrainerUI:
                 batch_size=128,
                 lr=1e-3,
                 progress_cb=cb,
+                rewards=pd_rews,
+                dones=pd_dones,
             )
-            print(f"[bc] done — final loss {stats.get('loss', float('nan')):.4f}")
+            print(
+                f"[bc] done — actor loss {stats.get('loss', float('nan')):.4f}"
+                f"   critic loss {stats.get('critic_loss', float('nan')):.4f}"
+            )
         except KeyboardInterrupt:
             print("[bc] cancelled by user")
             return False
@@ -750,7 +761,10 @@ class TrainerUI:
         if done:
             d.recent_rewards.append(d.ep_reward)
             d.all_rewards.append(d.ep_reward)
-            if len(d.recent_rewards) > 20:
+            # 30-wide window keeps the recent-fitness signal stable
+            # against single-episode outliers; raising from 20 cut
+            # selection-noise oscillation in population mode.
+            if len(d.recent_rewards) > 30:
                 d.recent_rewards.pop(0)
             if d.ep_reward > d.best_ep_reward:
                 d.best_ep_reward = d.ep_reward
