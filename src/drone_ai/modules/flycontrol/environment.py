@@ -289,15 +289,26 @@ class FlyControlEnv(gym.Env):
         if not airborne and not at_delivery_touchdown:
             reward -= 0.10
 
-        # Airborne baseline bonus — being upright and in the flight
-        # envelope (z ≥ 3 m, well above the 0.3 m airborne threshold)
-        # earns a small per-step reward regardless of horizontal
-        # distance from target. This makes "stay in the air, even if
-        # you can't reach the target" strictly better than "land,"
-        # which in turn pushes the gradient toward exploration in 3D
-        # rather than collapse onto the floor.
-        if airborne and upright and pos[2] >= 3.0:
+        # Airborne baseline bonus — being upright and inside the
+        # flight envelope earns a small per-step reward regardless of
+        # horizontal distance from target. This makes "stay in the
+        # air, even if you can't reach the target" strictly better
+        # than "land," pushing the gradient toward 3D exploration
+        # rather than collapse onto the floor. Capped at z ≤ 25 m so
+        # "spiral up forever" stops paying — without the cap the
+        # policy can find an attractor where it just gains altitude
+        # indefinitely, since +0.05/step at any altitude is positive.
+        if airborne and upright and 3.0 <= pos[2] <= 25.0:
             reward += 0.05
+
+        # Yaw-rate penalty — without this the reward function gives
+        # the policy no gradient signal to stop spinning. Drones early
+        # in training drift into spiral attractors (constant yaw rate
+        # combined with thrust = circular ascent) because spinning
+        # neither helps nor hurts the score. Quadratic in rad/s so
+        # mild yaw is essentially free and only fast spinning bites.
+        yaw_rate = float(state.angular_velocity[2])
+        reward -= 0.005 * yaw_rate * yaw_rate
 
         # Time penalty. Raised from -0.01 to -0.02 so pure survival is
         # net-negative unless the policy is actually earning shaping —
