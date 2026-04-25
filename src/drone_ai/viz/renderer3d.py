@@ -240,6 +240,11 @@ class Renderer:
         self.paused = False
         self.show_trail = True
         self.show_hud = True
+        # Debug overlay — toggled with the [D] key. Trainers / inspectors
+        # can read this flag and push extra metrics into the HUD when
+        # it's True. Default ON because the user explicitly asked to
+        # see live debug info during training.
+        self.show_debug = True
 
     # ---- Events ---------------------------------------------------------
 
@@ -279,6 +284,8 @@ class Renderer:
                     self.show_trail = not self.show_trail
                 elif ev.key == pygame.K_h:
                     self.show_hud = not self.show_hud
+                elif ev.key == pygame.K_d:
+                    self.show_debug = not self.show_debug
                 elif ev.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
                     self.camera.zoom(1 / 1.15)
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):

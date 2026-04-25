@@ -846,6 +846,43 @@ class TrainerUI:
                 "pop avg", f"{float(np.mean(others_overall)):+.1f}", None,
             ))
 
+        # Debug overlay — toggled with [D] in the viz, default on.
+        # Surfaces live reward breakdown + per-drone state so the user
+        # can see *why* training is stuck instead of just watching the
+        # grade. Helps diagnose attractors that aren't visible from the
+        # leader's grade alone (one drone may be soft-landing, another
+        # spiraling, another close to target).
+        if getattr(self.renderer, "show_debug", False):
+            bd = getattr(leader.env, "last_reward_breakdown", {}) or {}
+            d_dist = getattr(leader.env, "last_dist", 0.0)
+            d_alt = getattr(leader.env, "last_alt_err", 0.0)
+            metrics.append(("---", "DEBUG (toggle: D)", None))
+            metrics.append(("dist",   f"{d_dist:.2f} m", None))
+            metrics.append(("alt err", f"{d_alt:+.2f} m", None))
+            # Reward components that fired this tick. Hide near-zero
+            # entries so the panel only shows what's actually paying.
+            order = [
+                "far", "close", "tight", "alt_bonus", "task_event",
+                "yaw", "time", "idle_ground",
+                "out_of_bounds", "obstacle", "crash",
+            ]
+            for k in order:
+                v = bd.get(k, 0.0)
+                if abs(v) > 1e-4:
+                    metrics.append((f"r/{k}", f"{v:+.3f}", None))
+            metrics.append(("r/total", f"{bd.get('total', 0.0):+.3f}", None))
+            # Per-drone summary so you can see whether the population
+            # is converging or fragmenting.
+            for i, d in enumerate(self.drones):
+                fit = self._drone_fitness(d)
+                fit_str = "—" if fit == float("-inf") else f"{fit:+.0f}"
+                marker = "*" if i == leader_idx else " "
+                metrics.append((
+                    f"d{i}{marker}",
+                    f"ep={d.episode_idx} r̄={fit_str} u={d.update_idx}",
+                    None,
+                ))
+
         subtitle = self.stage_def["subtitle"]
         if self.base_model_name:
             subtitle = f"{subtitle}   •   base: {self.base_model_name}"

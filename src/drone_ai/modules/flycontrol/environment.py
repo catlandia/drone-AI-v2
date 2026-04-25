@@ -97,6 +97,12 @@ class FlyControlEnv(gym.Env):
         # only ever sees positions RELATIVE to this, because a real offline
         # drone with no GPS cannot know its absolute world coordinates.
         self._start_position: np.ndarray = np.zeros(3)
+        # Live debug state — populated each step in _compute_reward and
+        # read by the trainer's debug overlay so the user can see which
+        # reward components are firing in real time.
+        self.last_reward_breakdown: Dict[str, float] = {}
+        self.last_dist: float = 0.0
+        self.last_alt_err: float = 0.0
 
         self._renderer = None
 
@@ -199,22 +205,38 @@ class FlyControlEnv(gym.Env):
         dist = float(np.linalg.norm(pos - self.target))
         reward = 0.0
         done = False
+        # Per-step reward breakdown for the debug overlay. Each component
+        # accumulates into its own slot so the trainer's debug HUD can
+        # show exactly which terms fired and how much they paid.
+        bd: Dict[str, float] = {
+            "crash": 0.0, "out_of_bounds": 0.0, "obstacle": 0.0,
+            "far": 0.0, "close": 0.0, "tight": 0.0,
+            "alt_bonus": 0.0, "idle_ground": 0.0, "yaw": 0.0,
+            "time": 0.0, "task_event": 0.0,
+        }
+        self.last_reward_breakdown = bd
+        self.last_dist = dist
+        self.last_alt_err = float(pos[2] - self.target[2])
 
         # Crash penalty — real custom FPV drones are expensive and slow to
         # rebuild, so crashing is NOT cheap. Kept high (not the highest
         # possible) so the policy learns to avoid it, while still allowing
         # exploration through hover-biased init and lowered log_std.
         if state.crashed:
+            bd["crash"] = -50.0
             return -50.0, True
 
         # Out-of-bounds soft penalty
         if not self.world.in_bounds(pos):
             reward -= 5.0
+            bd["out_of_bounds"] = -5.0
 
         # Collision penalty
         _, obs_dist = self.world.nearest_obstacle(pos)
         if obs_dist < 0.5:
-            reward -= 10.0 * (0.5 - obs_dist)
+            collision_pen = 10.0 * (0.5 - obs_dist)
+            reward -= collision_pen
+            bd["obstacle"] = -collision_pen
 
         # --- Reward-hacking guards --------------------------------------
         # Targets for every task sit at z ≥ 5 m (hover/delivery have
@@ -253,37 +275,52 @@ class FlyControlEnv(gym.Env):
             # less attractive than the +6500 at d=0, ratio ~33×, so
             # the gradient is monotonically toward target.
             if can_shape:
-                reward += max(0.0, 0.3 * (1.0 - dist / 30.0))
+                far = max(0.0, 0.3 * (1.0 - dist / 30.0))
+                reward += far
+                bd["far"] = far
                 if dist < 5.0:
-                    reward += max(0.0, 5.0 - dist) * 0.4
+                    close = max(0.0, 5.0 - dist) * 0.4
+                    reward += close
+                    bd["close"] = close
                 if dist < 0.5:
                     reward += 2.0
+                    bd["tight"] = 2.0
 
         elif self.task == TaskType.DELIVERY:
             if not self.carrying:
                 if can_shape:
-                    reward += max(0.0, 3.0 - dist) * 0.3
+                    s = max(0.0, 3.0 - dist) * 0.3
+                    reward += s
+                    bd["close"] = s
                 if dist < 1.0:
                     self.carrying = True
                     self.target = self.dropzone.copy()
                     self.target[2] = 5.0
                     reward += 5.0
+                    bd["task_event"] = 5.0
             else:
                 if can_shape:
-                    reward += max(0.0, 3.0 - dist) * 0.3
+                    s = max(0.0, 3.0 - dist) * 0.3
+                    reward += s
+                    bd["close"] = s
                 if dist < 1.5:
                     reward += 50.0
+                    bd["task_event"] = 50.0
                     done = True
 
         elif self.task in (TaskType.DELIVERY_ROUTE, TaskType.DEPLOYMENT):
             if can_shape:
-                reward += max(0.0, 5.0 - dist) * 0.1
+                s = max(0.0, 5.0 - dist) * 0.1
+                reward += s
+                bd["close"] = s
             if dist < 2.0:
                 reward += 30.0
+                bd["task_event"] = 30.0
                 self.deliveries_done += 1
                 self.waypoint_idx += 1
                 if self.waypoint_idx >= len(self.waypoints):
                     reward += 100.0
+                    bd["task_event"] += 100.0
                     done = True
                 else:
                     self.target = self.waypoints[self.waypoint_idx].copy()
@@ -304,6 +341,7 @@ class FlyControlEnv(gym.Env):
         )
         if not airborne and not at_delivery_touchdown:
             reward -= 0.10
+            bd["idle_ground"] = -0.10
 
         # Altitude-tracking bonus — pay for being near the *target's*
         # altitude, not just any altitude in the flight envelope. The
@@ -321,6 +359,7 @@ class FlyControlEnv(gym.Env):
         # an arbitrary altitude range.
         if airborne and upright and abs(pos[2] - self.target[2]) < 5.0:
             reward += 0.05
+            bd["alt_bonus"] = 0.05
 
         # Yaw-rate penalty — without this the reward function gives
         # the policy no gradient signal to stop spinning. Linear in
@@ -333,13 +372,17 @@ class FlyControlEnv(gym.Env):
         # it. Mild yaw is nearly free; the gradient still pushes
         # toward calm flight without crushing exploration.
         yaw_rate = float(state.angular_velocity[2])
-        reward -= 0.005 * abs(yaw_rate)
+        yaw_pen = 0.005 * abs(yaw_rate)
+        reward -= yaw_pen
+        bd["yaw"] = -yaw_pen
 
         # Time penalty. Raised from -0.01 to -0.02 so pure survival is
         # net-negative unless the policy is actually earning shaping —
         # otherwise a drone that just hovers in-bounds forever grades
         # higher than one that occasionally nails the task.
         reward -= 0.02
+        bd["time"] = -0.02
+        bd["total"] = reward
 
         return reward, done
 
