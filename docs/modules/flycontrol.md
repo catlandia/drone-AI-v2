@@ -60,6 +60,16 @@ before opening a card. With `population > 1`:
   updates independently. `total_updates` is the *sum* across the
   population — a 6-drone run in the same budget trades per-drone depth
   for parallel diversity.
+- **Mid-run evolution.** Once every drone has done `evolve_every`
+  PPO updates since the last cull (default 25), the population is
+  ranked by consistency score and the bottom half is replaced with
+  mutated clones of the top half. This adds real selection pressure
+  during training instead of just picking the best at the end. Set
+  `evolve_every=0` to disable.
+- **Staggered PPO updates.** Each drone's `n_steps` is offset by
+  `i * stagger_steps` (default 8) so updates spread across frames
+  instead of clumping on the same tick — kills the visible stutter
+  when N drones all finish their buffer at once.
 - The camera follows the current leader (highest recent-mean reward).
   Peer drones render as small colored crosses at their world positions
   so you can watch the population diverge / converge live.
@@ -67,11 +77,40 @@ before opening a card. With `population > 1`:
   (`0.9*avg + 0.1*best − 0.5*std`) is saved. Other policies are
   discarded. The runs.csv row is tagged `popN`.
 
+> **Budget guidance.** Because `total_updates` is the *sum* across
+> the population, pop=6 with budget=400 gives each drone ~67 updates
+> — much shallower than a single-drone run with the same budget. For
+> parity, scale the budget with the population (e.g. budget ≈ 400 × N
+> if you want each drone to match a 400-update single-drone run). The
+> trade-off: pop=6 at 6× the budget takes ~6× the wall time but
+> produces the best of 6 mutated lineages instead of one lone policy.
+
 CLI equivalent:
 
 ```bash
 python -m drone_ai.viz.launcher --stage hover --updates 400 --population 6
 ```
+
+### GPU acceleration
+
+`PPOAgent` auto-detects CUDA (`torch.cuda.is_available()`) and uses
+the GPU when present. The trainer prints the active device on startup:
+
+```
+[trainer] device: cuda  ·  population: 6
+```
+
+If it prints `device: cpu` and you have an NVIDIA GPU, you have the
+CPU-only torch wheel installed. Replace it with the CUDA build:
+
+```bash
+pip uninstall -y torch
+# Pick the matching CUDA version (12.1 shown — see https://pytorch.org for others)
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+GPU acceleration helps the most for population mode, since N PPO
+updates per evolution cycle benefit from the parallel matmuls.
 
 ## Grading
 

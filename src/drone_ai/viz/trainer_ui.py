@@ -173,6 +173,20 @@ class TrainConfig:
     # defaults as PPOAgent.mutate.
     mutate_noise_std: float = 0.05
     mutate_prob: float = 0.1
+    # Periodic evolution within a single run. Every `evolve_every`
+    # per-drone updates (i.e. when *every* drone has done at least
+    # this many PPO updates since the last evolution), rank by
+    # consistency score, replace the bottom half with mutated clones
+    # of the top half. 0 disables mid-run evolution — population just
+    # trains in parallel and the best-of-N is saved at the end. Only
+    # has effect when population > 1.
+    evolve_every: int = 25
+    # Per-drone PPO buffer-size jitter. Each drone gets
+    # `steps_per_update + i * stagger_steps` so their PPO updates fire
+    # on different ticks instead of all clumping on the same frame.
+    # Removes the visible stutter when N drones all finish their buffer
+    # at once. 0 disables the offset.
+    stagger_steps: int = 8
 
 
 # ---- Per-drone state -------------------------------------------------------
@@ -183,6 +197,10 @@ class _DroneSlot:
     env: FlyControlEnv
     agent: PPOAgent
     obs: np.ndarray
+    # Per-drone PPO buffer size. Set from cfg.steps_per_update plus a
+    # per-index stagger offset so each drone's update fires on a
+    # different tick — see TrainConfig.stagger_steps.
+    n_steps: int = 512
     ep_reward: float = 0.0
     ep_len: int = 0
     episode_idx: int = 0
@@ -192,6 +210,10 @@ class _DroneSlot:
     recent_rewards: List[float] = field(default_factory=list)
     all_rewards: List[float] = field(default_factory=list)
     latest_loss: Optional[float] = None
+    # Per-drone update count at the most recent evolution event. Used
+    # to gate the next evolution: we only evolve once *every* drone has
+    # done at least `evolve_every` updates since this checkpoint.
+    last_evolve_update: int = 0
 
 
 # Distinct hues for up to 12 drones in the HUD / peer markers. Leader is
@@ -243,15 +265,26 @@ class TrainerUI:
         self.renderer = Renderer(
             title=f"{prefix} — {self.stage_def['title']}{title_suffix}"
         )
+        # Device reminder — when this prints "cpu" the user is running
+        # the CPU-only torch wheel. Reinstall with the CUDA index URL
+        # (see docs/quickstart.md) to get GPU acceleration.
+        print(f"[trainer] device: {seed_agent.device}  ·  population: {n}")
 
         # Build the population. Drone 0 owns the seed agent; the rest
         # start as clones and get mutated *after* BC warm-up so they
-        # inherit hover competence before diverging.
+        # inherit hover competence before diverging. Each drone gets
+        # its own n_steps with a small stagger so their PPO updates
+        # don't all fire on the same render frame.
         self.drones: List[_DroneSlot] = []
         for i in range(n):
             agent = seed_agent if i == 0 else seed_agent.clone()
             obs, _ = envs[i].reset(seed=cfg.seed + i)
-            self.drones.append(_DroneSlot(env=envs[i], agent=agent, obs=obs))
+            self.drones.append(_DroneSlot(
+                env=envs[i],
+                agent=agent,
+                obs=obs,
+                n_steps=cfg.steps_per_update + i * max(0, cfg.stagger_steps),
+            ))
         self._leader_idx_cache = 0
 
         # Run-log bookkeeping: capture wall-clock so the log has minutes.
@@ -316,6 +349,66 @@ class TrainerUI:
     def _total_updates_done(self) -> int:
         return sum(d.update_idx for d in self.drones)
 
+    def _maybe_evolve(self) -> None:
+        """Mid-run evolution. Once every drone has done at least
+        `cfg.evolve_every` PPO updates since the last cull, rank by
+        consistency score and replace the bottom half with mutated
+        clones of the top half. The replaced drones reset their PPO
+        buffer + recent-rewards stats since they're now new policies;
+        their env keeps flying so the viz doesn't teleport.
+
+        Skipped when population is too small to evolve (need at least 2
+        survivors and 1 victim) or when evolve_every == 0.
+        """
+        n = self.population_size
+        if n < 2 or self.cfg.evolve_every <= 0:
+            return
+        # Gate on the *minimum* per-drone update delta — only evolve
+        # once every drone has had at least evolve_every updates of
+        # selection-eligible training since the last event.
+        deltas = [d.update_idx - d.last_evolve_update for d in self.drones]
+        if min(deltas) < self.cfg.evolve_every:
+            return
+
+        ranked = sorted(
+            range(n),
+            key=lambda i: self._drone_stats(self.drones[i])["overall"],
+            reverse=True,
+        )
+        n_keep = max(1, n // 2)
+        survivors = ranked[:n_keep]
+        victims = ranked[n_keep:]
+
+        for j, victim_idx in enumerate(victims):
+            parent = self.drones[survivors[j % n_keep]].agent
+            child = parent.mutate(
+                noise_std=self.cfg.mutate_noise_std,
+                prob=self.cfg.mutate_prob,
+            )
+            slot = self.drones[victim_idx]
+            slot.agent = child
+            # Clear PPO buffer + recent-fitness stats: the new policy
+            # shouldn't be judged on the old one's last 20 episodes.
+            slot.recent_rewards = []
+            slot.steps_since_update = 0
+            slot.latest_loss = None
+            slot.last_evolve_update = slot.update_idx
+
+        # Survivors also reset their evolution checkpoint so the next
+        # gate measures from this generation onward.
+        for survivor_idx in survivors:
+            self.drones[survivor_idx].last_evolve_update = (
+                self.drones[survivor_idx].update_idx
+            )
+
+        if survivors:
+            top_score = self._drone_stats(self.drones[survivors[0]])["overall"]
+            print(
+                f"[evolve] gen mark @ updates={self._total_updates_done()}: "
+                f"survivors={survivors}, victims={victims}, "
+                f"top overall={top_score:+.1f}"
+            )
+
     # Convenience properties for the rendering / results / log code that
     # used to read self.<x> directly. They report the *leader's* numbers
     # so single-drone runs look identical to before.
@@ -358,11 +451,19 @@ class TrainerUI:
                     for _ in range(self.renderer.sim_speed):
                         # Step every drone once per tick. Each drone
                         # owns its own env + buffer; updates fire as
-                        # individual buffers fill.
+                        # individual buffers fill. Per-drone n_steps
+                        # is staggered so updates don't clump on the
+                        # same frame and stutter the viz.
                         for d in self.drones:
                             self._collect_step(d)
-                            if d.steps_since_update >= self.cfg.steps_per_update:
+                            if d.steps_since_update >= d.n_steps:
                                 self._do_update(d)
+                        # Mid-run evolution: once every drone has done
+                        # `evolve_every` updates since the last cull,
+                        # replace the bottom half with mutated clones
+                        # of the top half. Skips when population <= 1
+                        # or evolve_every == 0.
+                        self._maybe_evolve()
                         if self._total_updates_done() >= self.cfg.total_updates:
                             break
                 self._render_frame()
@@ -668,7 +769,7 @@ class TrainerUI:
         minutes = (time.monotonic() - self._start_time) / 60.0
         metrics = [
             ("update",  f"{self.update_idx}/{self.cfg.total_updates}", None),
-            ("buffer",  f"{leader.steps_since_update}/{self.cfg.steps_per_update}", None),
+            ("buffer",  f"{leader.steps_since_update}/{leader.n_steps}", None),
             ("episode", str(leader.episode_idx), None),
             ("ep step", str(leader.ep_len), None),
             ("ep R",    f"{leader.ep_reward:+.1f}", None),
