@@ -228,6 +228,7 @@ def _run_card(
     total_updates: int,
     population: int = 1,
     force_fresh: bool = False,
+    round_based: bool = False,
 ) -> None:
     """Execute the work for a card.
 
@@ -259,6 +260,7 @@ def _run_card(
             test_run=is_test,
             run_tag=tag,
             population=max(1, int(population)),
+            round_based=bool(round_based),
         )
         TrainerUI(cfg).run()
         return
@@ -376,6 +378,14 @@ class Launcher:
         # the same window, picks the best at the end. The cycle steps
         # land on values that look natural: 1, 2, 4, 6, 8, 12.
         self.population: int = 1
+        # Round-based evolution mode for FlyControl. Default OFF.
+        # When ON (toggle: [R]), training is split into discrete
+        # generations — each round trains for `round_length` per-drone
+        # updates with no culling, then a deterministic eval phase
+        # ranks every drone, then bottom half is replaced with mutated
+        # clones of the top half. Cleaner GA pattern, visible
+        # generation transitions. Only meaningful when population > 1.
+        self.round_based: bool = False
         self._recent_runs: List[Dict[str, str]] = _load_recent_runs()
         self._latest_ckpt: Dict[str, str] = _latest_flycontrol_per_stage()
 
@@ -452,6 +462,8 @@ class Launcher:
                     self.total_updates = max(50, self.total_updates - 100)
                 elif ev.key == pygame.K_p:
                     self.population = _next_population_step(self.population)
+                elif ev.key == pygame.K_r:
+                    self.round_based = not self.round_based
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if self.hover_idx is not None:
                     self.selected_idx = self.hover_idx
@@ -534,6 +546,7 @@ class Launcher:
             _run_card(
                 card, path, self.total_updates, self.population,
                 force_fresh=force_fresh,
+                round_based=self.round_based,
             )
         except Exception as e:
             print(f"[launcher] card '{card.key}' raised: {e}")
@@ -672,14 +685,19 @@ class Launcher:
             f"   ·   population: {self.population} drones"
             if self.population > 1 else ""
         )
+        round_suffix = (
+            "   ·   round-based evolution"
+            if (self.round_based and self.population > 1) else ""
+        )
         budget = self.font_md.render(
-            f"FlyControl training budget: {self.total_updates} updates{pop_suffix}",
+            f"FlyControl training budget: {self.total_updates} updates"
+            f"{pop_suffix}{round_suffix}",
             True, TEXT_DIM,
         )
         self.screen.blit(budget, (40, budget_y))
         hint = self.font_sm.render(
             "  [+/-] adjust budget   [P] cycle population   "
-            "[Enter] open picker   [Esc/Q] quit",
+            "[R] toggle round-based   [Enter] open picker   [Esc/Q] quit",
             True, TEXT_DIM,
         )
         self.screen.blit(hint, (40, budget_y + 18))
@@ -872,8 +890,13 @@ class Launcher:
             pop_suffix = (
                 f"  ·  pop {self.population}" if self.population > 1 else ""
             )
+            round_suffix = (
+                "  ·  round-based"
+                if (self.round_based and self.population > 1) else ""
+            )
             tip = (
-                f"  Budget: {self.total_updates} updates{pop_suffix}  "
+                f"  Budget: {self.total_updates} updates"
+                f"{pop_suffix}{round_suffix}  "
                 "[↑/↓] pick  [Enter] launch  [Esc] back"
             )
         else:

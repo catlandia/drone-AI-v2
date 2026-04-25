@@ -143,12 +143,21 @@ def score_adaptive(metrics: AdaptiveMetricsGrading) -> float:
 
 
 _FLYCONTROL_THRESHOLDS = [
-    ("P",  800), ("S+", 700), ("S",  600), ("S-", 550),
-    ("A+", 500), ("A",  450), ("A-", 400),
-    ("B+", 350), ("B",  300), ("B-", 250),
-    ("C+", 200), ("C",  150), ("C-", 100),
-    ("D+",  75), ("D",   50), ("D-",  25),
-    ("F+",  10), ("F",    0), ("F-", -50),
+    # Rescaled for the post-2026-04-25 reward shape, where a perfect
+    # 1500-step hover at target scores ~+6500/episode (close-band +
+    # tight + alt_bonus + far + idle/yaw/time penalties net to
+    # ~+4.3/step). The previous P=800 threshold was calibrated for an
+    # earlier reward landscape where episodes maxed around +1500-2000,
+    # which made "decent partial hover" read as "Perfect" once the new
+    # reward shape landed. ULTRAKILL P semantics: P-tier now means a
+    # genuinely flawless and consistent run — sustained target hover,
+    # low std, not just "good enough."
+    ("P",  5500), ("S+", 4500), ("S",  3500), ("S-", 3000),
+    ("A+", 2500), ("A",  2000), ("A-", 1500),
+    ("B+", 1200), ("B",   900), ("B-",  700),
+    ("C+",  500), ("C",   350), ("C-",  200),
+    ("D+",  100), ("D",    50), ("D-",   20),
+    ("F+",    5), ("F",     0), ("F-",  -50),
 ]
 
 _UNIVERSAL_THRESHOLDS = [

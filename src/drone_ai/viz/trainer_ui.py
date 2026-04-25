@@ -203,6 +203,18 @@ class TrainConfig:
     # Removes the visible stutter when N drones all finish their buffer
     # at once. 0 disables the offset.
     stagger_steps: int = 8
+    # Round-based evolution mode. Default OFF (continuous mid-run cull
+    # via _maybe_evolve, opportunistic). When ON, training alternates
+    # between training rounds and evaluation phases — the textbook
+    # genetic-algorithm pattern. Each round trains every drone for
+    # `round_length` PPO updates with no culling, then runs an eval
+    # phase (deterministic, no exploration noise) to score every drone
+    # cleanly, then culls + breeds, then begins the next round. Cleaner
+    # selection signal and obvious "Generation N" boundaries; small
+    # wall-time premium for the eval episodes.
+    round_based: bool = False
+    round_length: int = 30
+    eval_episodes: int = 3
 
 
 # ---- Per-drone state -------------------------------------------------------
@@ -310,6 +322,12 @@ class TrainerUI:
         # glance. Starts at 1 because gen 1 = the initial population
         # (post-BC, post-diversification) before any cull has fired.
         self._generation: int = 1
+        # Round-based mode state. _eval_active toggles the HUD subtitle
+        # so the user can see when training is paused for evaluation.
+        # _last_eval_scores is filled by _run_eval_phase and consumed
+        # by _round_evolve for ranking.
+        self._eval_active: bool = False
+        self._last_eval_scores: List[float] = []
 
         # Run-log bookkeeping: capture wall-clock so the log has minutes.
         self._start_time = time.monotonic()
@@ -385,6 +403,207 @@ class TrainerUI:
         worst = max(deltas_remaining) if deltas_remaining else 0
         target_total = self._total_updates_done() + worst * self.population_size
         return str(target_total)
+
+    # ---- Training loop variants ----------------------------------------
+
+    def _run_continuous(self, running: bool) -> bool:
+        """Continuous training with opportunistic mid-update evolution
+        (the original / default mode). Every drone steps every tick;
+        culls fire whenever every drone has done evolve_every updates
+        since the last cull."""
+        while running and self._total_updates_done() < self.cfg.total_updates:
+            running = self.renderer.handle_events(1 / 60)
+            if not running:
+                break
+            if not self.renderer.paused:
+                for _ in range(self.renderer.sim_speed):
+                    for d in self.drones:
+                        self._collect_step(d)
+                        if d.steps_since_update >= d.n_steps:
+                            self._do_update(d)
+                    self._maybe_evolve()
+                    if self._total_updates_done() >= self.cfg.total_updates:
+                        break
+            self._render_frame()
+            self.renderer.flip()
+        return running
+
+    def _run_round_based(self, running: bool) -> bool:
+        """Round-based evolution. Each generation:
+          1. Training round — every drone trains for cfg.round_length
+             PPO updates with no culling.
+          2. Eval phase — every drone runs cfg.eval_episodes
+             deterministic episodes for clean fitness scoring.
+          3. Cull — bottom half replaced with mutated clones of top
+             half, ranked by eval scores (not training-noise rewards).
+          4. Increment generation, repeat until budget exhausted.
+
+        Selection signal is much cleaner because ranking sees only
+        deterministic eval rewards, not noisy mid-training data; pays
+        a small wall-time premium for the eval episodes.
+        """
+        while running and self._total_updates_done() < self.cfg.total_updates:
+            # Training round — each drone advances by round_length
+            # updates, then we move to eval.
+            round_targets = [
+                d.update_idx + self.cfg.round_length for d in self.drones
+            ]
+            while running and any(
+                self.drones[i].update_idx < round_targets[i]
+                for i in range(self.population_size)
+            ):
+                running = self.renderer.handle_events(1 / 60)
+                if not running:
+                    return running
+                if self._total_updates_done() >= self.cfg.total_updates:
+                    return running
+                if not self.renderer.paused:
+                    for _ in range(self.renderer.sim_speed):
+                        for i, d in enumerate(self.drones):
+                            if d.update_idx >= round_targets[i]:
+                                continue  # this drone already finished the round
+                            self._collect_step(d)
+                            if d.steps_since_update >= d.n_steps:
+                                self._do_update(d)
+                self._render_frame()
+                self.renderer.flip()
+            if not running:
+                return running
+            if self._total_updates_done() >= self.cfg.total_updates:
+                return running
+            # Eval phase — score every drone on deterministic episodes.
+            running = self._run_eval_phase()
+            if not running:
+                return running
+            # Cull + breed using the clean eval scores.
+            self._round_evolve()
+        return running
+
+    def _run_eval_phase(self) -> bool:
+        """Run cfg.eval_episodes deterministic episodes per drone (all
+        drones step concurrently per tick, same seed sequence so
+        comparisons are apples-to-apples). Stores the per-drone mean
+        score in self._last_eval_scores. Returns False if the user
+        closed the window mid-eval."""
+        n_eps = max(1, self.cfg.eval_episodes)
+        per_drone_scores: List[List[float]] = [[] for _ in self.drones]
+        self._eval_active = True
+        try:
+            for ep_idx in range(n_eps):
+                # Reset all envs with a shared eval seed for this
+                # episode so every drone faces the same world geometry.
+                eval_seed = self.cfg.seed + 99999 + ep_idx
+                for d in self.drones:
+                    d.obs, _ = d.env.reset(seed=eval_seed)
+                    d.ep_reward = 0.0
+                    d.ep_len = 0
+                alive = [True] * self.population_size
+                # Episodes have a hard cap from the env; loop until
+                # everyone's done or we hit the cap.
+                max_steps = max(d.env._max_steps for d in self.drones)
+                for _step in range(max_steps):
+                    running = self.renderer.handle_events(1 / 60)
+                    if not running:
+                        self._eval_active = False
+                        return False
+                    if self.renderer.paused:
+                        # Don't advance the eval if the user paused;
+                        # render and check events again next tick.
+                        self._render_frame()
+                        self.renderer.flip()
+                        continue
+                    for _ in range(self.renderer.sim_speed):
+                        any_alive = False
+                        for i, d in enumerate(self.drones):
+                            if not alive[i]:
+                                continue
+                            any_alive = True
+                            # Deterministic action — no sampling noise
+                            # so the eval scores reflect the policy
+                            # mean only, not exploration luck.
+                            action, _ = d.agent.select_action(
+                                d.obs, deterministic=True
+                            )
+                            next_obs, reward, term, trunc, _ = d.env.step(action)
+                            d.ep_reward += float(reward)
+                            d.ep_len += 1
+                            d.obs = next_obs
+                            if term or trunc:
+                                alive[i] = False
+                                per_drone_scores[i].append(d.ep_reward)
+                        if not any_alive:
+                            break
+                    self._render_frame()
+                    self.renderer.flip()
+                    if not any(alive):
+                        break
+                # Record any drones that survived the full episode
+                # without termination (rare but possible).
+                for i, d in enumerate(self.drones):
+                    if alive[i]:
+                        per_drone_scores[i].append(d.ep_reward)
+                        alive[i] = False
+        finally:
+            self._eval_active = False
+        # Mean across episodes per drone, with a sentinel for any
+        # drone that produced no scores at all (shouldn't happen).
+        self._last_eval_scores = [
+            float(np.mean(s)) if s else float("-inf")
+            for s in per_drone_scores
+        ]
+        # Reset env state for the next training round so PPO doesn't
+        # inherit eval-phase rollout state.
+        for i, d in enumerate(self.drones):
+            d.obs, _ = d.env.reset(seed=self.cfg.seed + d.episode_idx)
+            d.ep_reward = 0.0
+            d.ep_len = 0
+            d.steps_since_update = 0
+        return True
+
+    def _round_evolve(self) -> None:
+        """Cull + breed at a round boundary using eval scores. Same
+        replacement pattern as _maybe_evolve (top half breeds into
+        bottom half, victims get fresh-slate reset) but driven by the
+        deterministic eval ranking instead of recent_rewards. Always
+        fires at every round boundary in round-based mode."""
+        n = self.population_size
+        if n < 2 or not self._last_eval_scores:
+            return
+        ranked = sorted(
+            range(n), key=lambda i: self._last_eval_scores[i], reverse=True
+        )
+        n_keep = max(1, n // 2)
+        survivors = ranked[:n_keep]
+        victims = ranked[n_keep:]
+        for j, victim_idx in enumerate(victims):
+            parent = self.drones[survivors[j % n_keep]].agent
+            child = parent.mutate(
+                noise_std=self.cfg.mutate_noise_std,
+                prob=self.cfg.mutate_prob,
+            )
+            slot = self.drones[victim_idx]
+            slot.agent = child
+            slot.recent_rewards = []
+            slot.all_rewards = []
+            slot.best_ep_reward = float("-inf")
+            slot.episode_idx = 0
+            slot.steps_since_update = 0
+            slot.latest_loss = None
+            slot.last_evolve_update = slot.update_idx
+        for survivor_idx in survivors:
+            self.drones[survivor_idx].last_evolve_update = (
+                self.drones[survivor_idx].update_idx
+            )
+        self._generation += 1
+        top_score = self._last_eval_scores[survivors[0]]
+        print(
+            f"[evolve] gen {self._generation} (round-based) @ "
+            f"updates={self._total_updates_done()}: "
+            f"survivors={survivors}, victims={victims}, "
+            f"top eval={top_score:+.1f}"
+        )
+
+    # ---- Fitness helpers -----------------------------------------------
 
     def _drone_fitness(self, d: _DroneSlot) -> float:
         """Current fitness for evolution ranking and leader selection.
@@ -504,31 +723,16 @@ class TrainerUI:
             # therefore takes ~the same wall time as a 1-drone run, but
             # spreads the work across multiple parallel policies and
             # picks the winner at the end.
-            while running and self._total_updates_done() < self.cfg.total_updates:
-                running = self.renderer.handle_events(1 / 60)
-                if not running:
-                    break
-                if not self.renderer.paused:
-                    for _ in range(self.renderer.sim_speed):
-                        # Step every drone once per tick. Each drone
-                        # owns its own env + buffer; updates fire as
-                        # individual buffers fill. Per-drone n_steps
-                        # is staggered so updates don't clump on the
-                        # same frame and stutter the viz.
-                        for d in self.drones:
-                            self._collect_step(d)
-                            if d.steps_since_update >= d.n_steps:
-                                self._do_update(d)
-                        # Mid-run evolution: once every drone has done
-                        # `evolve_every` updates since the last cull,
-                        # replace the bottom half with mutated clones
-                        # of the top half. Skips when population <= 1
-                        # or evolve_every == 0.
-                        self._maybe_evolve()
-                        if self._total_updates_done() >= self.cfg.total_updates:
-                            break
-                self._render_frame()
-                self.renderer.flip()
+            #
+            # Two modes:
+            #   round-based : alternate train rounds + eval + cull
+            #                 (textbook GA, clean generation boundaries)
+            #   continuous  : opportunistic mid-update culling via
+            #                 _maybe_evolve (default)
+            if self.cfg.round_based and self.population_size > 1:
+                running = self._run_round_based(running)
+            else:
+                running = self._run_continuous(running)
 
             finished_naturally = self._total_updates_done() >= self.cfg.total_updates
 
@@ -967,6 +1171,10 @@ class TrainerUI:
             subtitle = f"{subtitle}   •   base: fresh (TEST)"
         if self.population_size > 1:
             subtitle = f"{subtitle}   •   pop: {self.population_size}"
+        if self.cfg.round_based and self.population_size > 1:
+            subtitle = f"{subtitle}   •   gen {self._generation}"
+            if self._eval_active:
+                subtitle = f"{subtitle}   •   EVAL PHASE (deterministic)"
         if self._bc_status is not None:
             subtitle = f"{subtitle}   •   {self._bc_status}"
         title_prefix = "TEST TRAINING" if (self.cfg.test_run or not self.base_model_name) else "TRAINING"
