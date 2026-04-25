@@ -268,7 +268,11 @@ class Renderer:
             if ev.type == pygame.QUIT:
                 return False
             if ev.type == pygame.KEYDOWN:
-                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
+                # Quit only on Q (and the window's X button via QUIT
+                # event above). Escape used to close the window too,
+                # which collided with Win+Shift+S / Ctrl+Win+S
+                # screenshot shortcuts that surface Esc on dismiss.
+                if ev.key == pygame.K_q:
                     return False
                 elif ev.key == pygame.K_SPACE:
                     self.paused = not self.paused

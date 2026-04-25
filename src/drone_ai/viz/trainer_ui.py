@@ -305,6 +305,11 @@ class TrainerUI:
                 n_steps=cfg.steps_per_update + i * max(0, cfg.stagger_steps),
             ))
         self._leader_idx_cache = 0
+        # Generation counter for the debug overlay. Increments on every
+        # _maybe_evolve cull so the user can see "we're on gen 7" at a
+        # glance. Starts at 1 because gen 1 = the initial population
+        # (post-BC, post-diversification) before any cull has fired.
+        self._generation: int = 1
 
         # Run-log bookkeeping: capture wall-clock so the log has minutes.
         self._start_time = time.monotonic()
@@ -361,6 +366,25 @@ class TrainerUI:
 
     def _total_updates_done(self) -> int:
         return sum(d.update_idx for d in self.drones)
+
+    def _next_cull_at_total(self) -> str:
+        """Estimate the total-update count when the next cull will fire.
+        Used by the debug overlay so the user can see how many updates
+        away the next generation transition is. Falls back to "—" when
+        evolution is disabled or population is too small."""
+        if self.population_size < 2 or self.cfg.evolve_every <= 0:
+            return "—"
+        # The cull gate fires once *every* drone has done evolve_every
+        # updates since its last_evolve_update. Predict the soonest
+        # total-update count that satisfies that, assuming each drone
+        # advances at the same rate from here.
+        deltas_remaining = [
+            max(0, self.cfg.evolve_every - (d.update_idx - d.last_evolve_update))
+            for d in self.drones
+        ]
+        worst = max(deltas_remaining) if deltas_remaining else 0
+        target_total = self._total_updates_done() + worst * self.population_size
+        return str(target_total)
 
     def _drone_fitness(self, d: _DroneSlot) -> float:
         """Current fitness for evolution ranking and leader selection.
@@ -437,10 +461,11 @@ class TrainerUI:
                 self.drones[survivor_idx].update_idx
             )
 
+        self._generation += 1
         if survivors:
             top_fit = self._drone_fitness(self.drones[survivors[0]])
             print(
-                f"[evolve] gen mark @ updates={self._total_updates_done()}: "
+                f"[evolve] gen {self._generation} @ updates={self._total_updates_done()}: "
                 f"survivors={survivors}, victims={victims}, "
                 f"top recent={top_fit:+.1f}"
             )
@@ -546,6 +571,24 @@ class TrainerUI:
         std = float(np.std(d.all_rewards)) if len(d.all_rewards) > 1 else 0.0
         best = d.best_ep_reward if d.best_ep_reward != float("-inf") else avg
         overall = consistency_score(best, avg, std) if d.all_rewards else 0.0
+        return {"avg": avg, "std": std, "best": best, "overall": overall}
+
+    def _drone_stats_recent(self, d: _DroneSlot) -> Dict[str, float]:
+        """Stats over the recent-rewards window only — what the policy
+        is doing *now*, not over its lifetime. Used for the live HUD
+        grade so the displayed tier reflects current performance
+        instead of being dragged down forever by early-run failures.
+        Lifetime stats still drive the saved checkpoint's grade and
+        the runs.csv row (those describe the full run, where lifetime
+        makes sense).
+        """
+        rr = d.recent_rewards
+        if not rr:
+            return {"avg": 0.0, "std": 0.0, "best": 0.0, "overall": 0.0}
+        avg = float(np.mean(rr))
+        std = float(np.std(rr)) if len(rr) > 1 else 0.0
+        best = float(max(rr))
+        overall = consistency_score(best, avg, std)
         return {"avg": avg, "std": std, "best": best, "overall": overall}
 
     def _winner_drone(self) -> _DroneSlot:
@@ -809,16 +852,20 @@ class TrainerUI:
         leader_idx = self._leader_index()
         leader = self.drones[leader_idx]
         self._leader_idx_cache = leader_idx
-        avg_recent = (
-            sum(leader.recent_rewards) / len(leader.recent_rewards)
-            if leader.recent_rewards else 0.0
-        )
-        st = self._drone_stats(leader)
-        avg_all, std_all, best, overall = (
-            st["avg"], st["std"], st["best"], st["overall"]
-        )
+        # Live HUD uses RECENT-window stats so the grade tracks current
+        # performance. Lifetime stats still drive the saved checkpoint's
+        # grade (see _winner_drone / _log_run / _show_results_screen).
+        recent = self._drone_stats_recent(leader)
+        avg_recent = recent["avg"]
+        std_recent = recent["std"]
+        best_recent = recent["best"]
+        overall_recent = recent["overall"]
+        # Lifetime stats — exposed in debug only so the user can
+        # cross-check against runs.csv after the run finishes.
+        life = self._drone_stats(leader)
         grade = (
-            score_to_flycontrol_grade(overall) if leader.all_rewards else "—"
+            score_to_flycontrol_grade(overall_recent)
+            if leader.recent_rewards else "—"
         )
         minutes = (time.monotonic() - self._start_time) / 60.0
         metrics = [
@@ -828,10 +875,11 @@ class TrainerUI:
             ("ep step", str(leader.ep_len), None),
             ("ep R",    f"{leader.ep_reward:+.1f}", None),
             ("avg R",   f"{avg_recent:+.1f}", None),
-            ("std R",   f"{std_all:.1f}", None),
-            ("overall", f"{overall:+.1f}" if leader.all_rewards else "—", None),
-            ("best R",  f"{best:+.1f}"
-                        if leader.best_ep_reward != float("-inf") else "—", None),
+            ("std R",   f"{std_recent:.1f}", None),
+            ("overall", f"{overall_recent:+.1f}"
+                        if leader.recent_rewards else "—", None),
+            ("best R",  f"{best_recent:+.1f}"
+                        if leader.recent_rewards else "—", None),
             ("grade",   grade, None),
             ("time",    f"{minutes:.1f} min", None),
         ]
@@ -857,8 +905,29 @@ class TrainerUI:
             d_dist = getattr(leader.env, "last_dist", 0.0)
             d_alt = getattr(leader.env, "last_alt_err", 0.0)
             metrics.append(("---", "DEBUG (toggle: D)", None))
+            metrics.append((
+                "gen",
+                f"{self._generation}  (next cull at "
+                f"{self._next_cull_at_total()})",
+                None,
+            ))
             metrics.append(("dist",   f"{d_dist:.2f} m", None))
             metrics.append(("alt err", f"{d_alt:+.2f} m", None))
+            # Lifetime stats for cross-checking against runs.csv after
+            # the run finishes — live grade above is recent-window.
+            metrics.append(("life avg", f"{life['avg']:+.1f}", None))
+            metrics.append(("life ovr", f"{life['overall']:+.1f}", None))
+            # Recent episode rewards for the leader — sparkline-ish
+            # readout so you can see the actual trajectory of episode
+            # outcomes, not just the mean. Last 5 most recent on the
+            # right; older entries scroll off as the window fills.
+            recent_eps = leader.recent_rewards[-5:]
+            if recent_eps:
+                metrics.append((
+                    "ep hist",
+                    "  ".join(f"{r:+.0f}" for r in recent_eps),
+                    None,
+                ))
             # Reward components that fired this tick. Hide near-zero
             # entries so the panel only shows what's actually paying.
             order = [
@@ -872,14 +941,20 @@ class TrainerUI:
                     metrics.append((f"r/{k}", f"{v:+.3f}", None))
             metrics.append(("r/total", f"{bd.get('total', 0.0):+.3f}", None))
             # Per-drone summary so you can see whether the population
-            # is converging or fragmenting.
+            # is converging or fragmenting. Per-drone dist gives at-a-
+            # glance "is this drone near the target right now" without
+            # having to hunt through the 3D scene for its peer marker.
             for i, d in enumerate(self.drones):
                 fit = self._drone_fitness(d)
                 fit_str = "—" if fit == float("-inf") else f"{fit:+.0f}"
                 marker = "*" if i == leader_idx else " "
+                d_d = float(np.linalg.norm(
+                    d.env.physics.state.position - d.env.target
+                ))
                 metrics.append((
                     f"d{i}{marker}",
-                    f"ep={d.episode_idx} r̄={fit_str} u={d.update_idx}",
+                    f"ep={d.episode_idx:<3} r̄={fit_str:<5} "
+                    f"u={d.update_idx:<3} d={d_d:.0f}m",
                     None,
                 ))
 
