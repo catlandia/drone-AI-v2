@@ -87,10 +87,10 @@ drone-ai train manager --grade P
 drone-ai curriculum                   # everything in sequence
 
 # Phase 2 — Layers 5-8
-py -m drone_ai.modules.adaptive.train       # auto-finds latest fc ckpt
-py -m drone_ai.modules.storage.train        # field-log stress test
-py -m drone_ai.modules.personality.train    # export artifact from newest fc
-py -m drone_ai.modules.swarm.train          # coordinator benchmark
+python -m drone_ai.modules.adaptive.train       # auto-finds latest fc ckpt
+python -m drone_ai.modules.storage.train        # field-log stress test
+python -m drone_ai.modules.personality.train    # export artifact from newest fc
+python -m drone_ai.modules.swarm.train          # coordinator benchmark
 
 # CLI helpers
 drone-ai storage <drone-id>                         # dump a field log summary

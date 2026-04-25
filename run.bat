@@ -8,18 +8,18 @@ REM ========================================================================
 setlocal
 cd /d "%~dp0"
 
-where py >nul 2>nul
+where python >nul 2>nul
 if errorlevel 1 (
-    echo [ERROR] Python launcher "py" not found. Install Python 3.9+ from python.org.
+    echo [ERROR] Python not found on PATH. Install Python 3.9+ from python.org.
     pause
     exit /b 1
 )
 
-py -c "import drone_ai, pygame" 2>nul
+python -c "import drone_ai, pygame" 2>nul
 if errorlevel 1 (
     echo [setup] Installing Drone AI and dependencies... this happens once.
-    py -m pip install --upgrade pip
-    py -m pip install -e ".[viz]"
+    python -m pip install --upgrade pip
+    python -m pip install -e ".[viz]"
     if errorlevel 1 (
         echo [ERROR] Installation failed. See messages above.
         pause
@@ -27,6 +27,6 @@ if errorlevel 1 (
     )
 )
 
-py -m drone_ai.viz.launcher %*
+python -m drone_ai.viz.launcher %*
 if errorlevel 1 pause
 endlocal

@@ -484,7 +484,7 @@ Proposed defaults; Layer 5 can tune later.
 
 ## 20. Verification checklist
 
-- **Bug fix:** Launch via `py -m drone_ai.viz.launcher`, start a
+- **Bug fix:** Launch via `python -m drone_ai.viz.launcher`, start a
   training stage, close child window via X. Launcher stays alive and
   reusable. `models/{Grade} {DD-MM-YYYY} flycontrol v{N}.pt` is on
   disk. `models/runs.csv` has a matching row. Close launcher via X.
