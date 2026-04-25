@@ -45,6 +45,34 @@ See [training.md](../training.md#flycontrol) for the curriculum.
 drone-ai train flycontrol --population 6 --ages 10 --steps 10000
 ```
 
+### Live population mode in the launcher
+
+The launcher's per-stage cards run a single drone by default but can
+also train a parallel population inside the same window. From the menu,
+press **`P`** to cycle the population through `1 → 2 → 4 → 6 → 8 → 12`
+before opening a card. With `population > 1`:
+
+- N envs and N PPO agents are created. BC warm-up runs once on drone 0;
+  the rest are cloned from the warmed-up drone and mutated (σ=0.05,
+  10% of params) so they start with the same hover competence but
+  diverge.
+- Every drone steps once per tick. Each drone's PPO buffer fills and
+  updates independently. `total_updates` is the *sum* across the
+  population — a 6-drone run in the same budget trades per-drone depth
+  for parallel diversity.
+- The camera follows the current leader (highest recent-mean reward).
+  Peer drones render as small colored crosses at their world positions
+  so you can watch the population diverge / converge live.
+- At the end, the drone with the highest consistency-weighted score
+  (`0.9*avg + 0.1*best − 0.5*std`) is saved. Other policies are
+  discarded. The runs.csv row is tagged `popN`.
+
+CLI equivalent:
+
+```bash
+python -m drone_ai.viz.launcher --stage hover --updates 400 --population 6
+```
+
 ## Grading
 
 `FlyControlMetrics` captures eval rewards on each of the 4 stages. Weighted sum → grade via `ModelGrader.grade_flycontrol()`:

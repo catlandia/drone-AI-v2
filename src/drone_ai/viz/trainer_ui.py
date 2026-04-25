@@ -3,13 +3,19 @@ the current policy's behavior in a 3D window.
 
 Every render frame we step the env with the current policy; every N steps
 a PPO update runs. Rewards and episode stats accumulate into the HUD.
+
+When `TrainConfig.population > 1`, N drones train in parallel inside the
+same window. BC warm-up runs once on drone 0; the rest are cloned from
+that warmed-up policy and mutated so they diverge. Camera follows the
+current leader (highest recent-mean reward). At the end, the best-of-
+population by consistency score is saved.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -157,19 +163,65 @@ class TrainConfig:
     bc_warmup: bool = True
     bc_episodes: int = 6
     bc_epochs: int = 60
+    # Population-based training. N drones train in parallel inside the
+    # same window — same selection-pressure idea as the CLI population
+    # trainer (drone_ai.modules.flycontrol.train), with live 3D viz.
+    # population == 1 reproduces the original single-drone behavior.
+    population: int = 1
+    # Mutation applied to clones 1..N-1 after seeding from drone 0, so
+    # the population starts diverse instead of N identical copies. Same
+    # defaults as PPOAgent.mutate.
+    mutate_noise_std: float = 0.05
+    mutate_prob: float = 0.1
+
+
+# ---- Per-drone state -------------------------------------------------------
+
+@dataclass
+class _DroneSlot:
+    """One drone in the population — its env, agent, and per-drone counters."""
+    env: FlyControlEnv
+    agent: PPOAgent
+    obs: np.ndarray
+    ep_reward: float = 0.0
+    ep_len: int = 0
+    episode_idx: int = 0
+    update_idx: int = 0
+    steps_since_update: int = 0
+    best_ep_reward: float = float("-inf")
+    recent_rewards: List[float] = field(default_factory=list)
+    all_rewards: List[float] = field(default_factory=list)
+    latest_loss: Optional[float] = None
+
+
+# Distinct hues for up to 12 drones in the HUD / peer markers. Leader is
+# always drawn with the renderer's normal drone colors; peers borrow these.
+PEER_COLORS: List[Tuple[int, int, int]] = [
+    (120, 220, 150), (140, 200, 230), (240, 170, 90),
+    (220, 140, 210), (240, 100, 110), (200, 180, 100),
+    (160, 200, 100), (100, 200, 200), (220, 110, 220),
+    (180, 130, 100), (130, 180, 220), (220, 200, 120),
+]
 
 
 class TrainerUI:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         self.stage_def = STAGE_DEFS.get(cfg.stage, STAGE_DEFS["hover"])
-        self.env = FlyControlEnv(
-            task=self.stage_def["task"],
-            difficulty=self.stage_def["difficulty"],
-            domain_randomization=self.stage_def["domain_rand"],
-            seed=cfg.seed,
-        )
-        self.agent = PPOAgent(obs_dim=OBS_DIM, act_dim=ACT_DIM, config=PPOConfig())
+        n = max(1, int(cfg.population))
+        # Build N envs (each drone gets its own physics instance) and N
+        # agents. Drone 0 is the seed; others are cloned + mutated from
+        # it after BC warm-up so the population starts diverse.
+        envs = [
+            FlyControlEnv(
+                task=self.stage_def["task"],
+                difficulty=self.stage_def["difficulty"],
+                domain_randomization=self.stage_def["domain_rand"],
+                seed=cfg.seed + i,
+            )
+            for i in range(n)
+        ]
+        seed_agent = PPOAgent(obs_dim=OBS_DIM, act_dim=ACT_DIM, config=PPOConfig())
         # Warm-start order (PLAN.md §4 curriculum chain):
         #   1. Explicit cfg.warm_start_path — picked by the launcher's
         #      pre-launch picker. The user wins.
@@ -181,26 +233,29 @@ class TrainerUI:
         warm = cfg.warm_start_path or resolve_warm_start(models_root, cfg.stage)
         if warm is not None:
             try:
-                self.agent.load(warm)
+                seed_agent.load(warm)
                 self.base_model_name = os.path.basename(warm)
                 print(f"[trainer] warm-started {cfg.stage} from {warm}")
             except Exception as e:
                 print(f"[trainer] warm-start skipped ({warm}): {e}")
         prefix = "Test Training" if cfg.test_run else "Training"
-        self.renderer = Renderer(title=f"{prefix} — {self.stage_def['title']}")
+        title_suffix = f" × {n}" if n > 1 else ""
+        self.renderer = Renderer(
+            title=f"{prefix} — {self.stage_def['title']}{title_suffix}"
+        )
 
-        self.obs, _ = self.env.reset(seed=cfg.seed)
-        self.ep_reward = 0.0
-        self.ep_len = 0
-        self.episode_idx = 0
-        self.update_idx = 0
-        self.steps_since_update = 0
-        self.best_ep_reward = -float("inf")
-        self.recent_rewards: List[float] = []
-        self.latest_loss: Optional[float] = None
+        # Build the population. Drone 0 owns the seed agent; the rest
+        # start as clones and get mutated *after* BC warm-up so they
+        # inherit hover competence before diverging.
+        self.drones: List[_DroneSlot] = []
+        for i in range(n):
+            agent = seed_agent if i == 0 else seed_agent.clone()
+            obs, _ = envs[i].reset(seed=cfg.seed + i)
+            self.drones.append(_DroneSlot(env=envs[i], agent=agent, obs=obs))
+        self._leader_idx_cache = 0
+
         # Run-log bookkeeping: capture wall-clock so the log has minutes.
         self._start_time = time.monotonic()
-        self._all_rewards: List[float] = []
         # BC warm-up status — exposed on the HUD so the user can tell
         # the actor is being imitation-trained before PPO kicks in.
         self._bc_status: Optional[str] = None
@@ -211,6 +266,66 @@ class TrainerUI:
         self._should_bc = (
             self.cfg.bc_warmup and self.base_model_name is None
         )
+        # When BC won't run (warm-started from disk), diversify the
+        # clones now so the population doesn't start as N identical
+        # copies. With BC, diversification fires after warm-up.
+        if not self._should_bc:
+            self._diversify_population()
+
+    # ---- Population helpers --------------------------------------------
+
+    @property
+    def population_size(self) -> int:
+        return len(self.drones)
+
+    def _diversify_population(self) -> None:
+        """Replace clones 1..N-1 with mutated copies of drone 0 so the
+        population starts with shared skill but distinct policies.
+
+        Called after BC warm-up (so all drones inherit hover competence)
+        or right after a warm-start checkpoint load (same idea — give
+        every drone the base, then perturb to create selection signal)."""
+        if self.population_size <= 1:
+            return
+        seed = self.drones[0].agent
+        for i in range(1, self.population_size):
+            self.drones[i].agent = seed.mutate(
+                noise_std=self.cfg.mutate_noise_std,
+                prob=self.cfg.mutate_prob,
+            )
+
+    def _leader_index(self) -> int:
+        """Drone with the highest recent-mean reward; falls back to the
+        first drone if nobody has finished an episode yet. Camera and
+        HUD follow this index, and it's recomputed every frame so the
+        leader can change as the run progresses."""
+        best_idx = 0
+        best_score = float("-inf")
+        for i, d in enumerate(self.drones):
+            if d.recent_rewards:
+                score = sum(d.recent_rewards) / len(d.recent_rewards)
+            elif d.best_ep_reward != float("-inf"):
+                score = d.best_ep_reward
+            else:
+                score = float("-inf")
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        return best_idx
+
+    def _total_updates_done(self) -> int:
+        return sum(d.update_idx for d in self.drones)
+
+    # Convenience properties for the rendering / results / log code that
+    # used to read self.<x> directly. They report the *leader's* numbers
+    # so single-drone runs look identical to before.
+    @property
+    def update_idx(self) -> int:
+        return self._total_updates_done()
+
+    @property
+    def episode_idx(self) -> int:
+        return sum(d.episode_idx for d in self.drones)
 
     # ------------------------------------------------------------------
 
@@ -220,36 +335,56 @@ class TrainerUI:
         save_path: Optional[str] = None
         try:
             # Step 0: Behavior-cloning warm-up (only for fresh starts).
+            # In population mode, BC runs once on drone 0 and the rest
+            # are diversified clones — see _run_bc_warmup.
             if self._should_bc:
                 running = self._run_bc_warmup()
-                # Rewind the env so the first PPO step doesn't inherit
-                # the PD rollout's final state.
+                # Rewind every drone's env so the first PPO step doesn't
+                # inherit the PD rollout's final state.
                 if running:
-                    self.obs, _ = self.env.reset(seed=self.cfg.seed)
+                    for i, d in enumerate(self.drones):
+                        d.obs, _ = d.env.reset(seed=self.cfg.seed + i)
 
-            while running and self.update_idx < self.cfg.total_updates:
+            # Outer loop: total_updates is the *sum* across the
+            # population. A 6-drone run with the same total_updates
+            # therefore takes ~the same wall time as a 1-drone run, but
+            # spreads the work across multiple parallel policies and
+            # picks the winner at the end.
+            while running and self._total_updates_done() < self.cfg.total_updates:
                 running = self.renderer.handle_events(1 / 60)
                 if not running:
                     break
                 if not self.renderer.paused:
                     for _ in range(self.renderer.sim_speed):
-                        self._collect_step()
-                        if self.steps_since_update >= self.cfg.steps_per_update:
-                            self._do_update()
+                        # Step every drone once per tick. Each drone
+                        # owns its own env + buffer; updates fire as
+                        # individual buffers fill.
+                        for d in self.drones:
+                            self._collect_step(d)
+                            if d.steps_since_update >= self.cfg.steps_per_update:
+                                self._do_update(d)
+                        if self._total_updates_done() >= self.cfg.total_updates:
                             break
                 self._render_frame()
                 self.renderer.flip()
 
-            finished_naturally = self.update_idx >= self.cfg.total_updates
+            finished_naturally = self._total_updates_done() >= self.cfg.total_updates
 
             # Always persist the trained weights — previously the UI path
             # left save_path=None so training runs vanished on exit. Name
             # the file with the tier-list convention so runs.csv rows and
-            # disk checkpoints share a grade + date + version.
+            # disk checkpoints share a grade + date + version. In
+            # population mode, save the winner (best consistency score).
             save_path = self.cfg.save_path or self._auto_save_path()
             try:
-                self.agent.save(save_path)
+                winner = self._winner_drone()
+                winner.agent.save(save_path)
                 print(f"[trainer] saved checkpoint -> {save_path}")
+                if self.population_size > 1:
+                    print(
+                        f"[trainer] winner = drone {self.drones.index(winner)} "
+                        f"of {self.population_size}"
+                    )
             except Exception as e:
                 print(f"[trainer] save failed: {e}")
 
@@ -269,27 +404,57 @@ class TrainerUI:
             self.renderer.close()
         return finished_naturally
 
+    def _drone_stats(self, d: _DroneSlot) -> Dict[str, float]:
+        avg = float(np.mean(d.all_rewards)) if d.all_rewards else 0.0
+        std = float(np.std(d.all_rewards)) if len(d.all_rewards) > 1 else 0.0
+        best = d.best_ep_reward if d.best_ep_reward != float("-inf") else avg
+        overall = consistency_score(best, avg, std) if d.all_rewards else 0.0
+        return {"avg": avg, "std": std, "best": best, "overall": overall}
+
+    def _winner_drone(self) -> _DroneSlot:
+        """Pick the population member with the highest consistency score.
+        Ties broken by best episode reward."""
+        scored = sorted(
+            self.drones,
+            key=lambda d: (self._drone_stats(d)["overall"],
+                           self._drone_stats(d)["best"]),
+            reverse=True,
+        )
+        return scored[0]
+
     def _show_results_screen(self, save_path: Optional[str]) -> None:
         """Block on a results panel until the user presses any key /
         clicks / closes the window. Lets them read the final grade
         before returning to the launcher."""
-        from drone_ai.grading import GRADE_NAMES, GRADE_DESCRIPTIONS
-        avg = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
-        std = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
-        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        overall = consistency_score(best, avg, std) if self._all_rewards else 0.0
-        grade = score_to_flycontrol_grade(overall) if self._all_rewards else "—"
+        from drone_ai.grading import GRADE_NAMES
+        winner = self._winner_drone()
+        st = self._drone_stats(winner)
+        avg, std, best, overall = st["avg"], st["std"], st["best"], st["overall"]
+        grade = (
+            score_to_flycontrol_grade(overall) if winner.all_rewards else "—"
+        )
         minutes = (time.monotonic() - self._start_time) / 60.0
         is_test = self.cfg.test_run or not self.base_model_name
         title = (
             f"TEST TRAINING — {self.stage_def['title']}"
             if is_test else f"FlyControl — {self.stage_def['title']}"
         )
+        pop_line: List[Tuple[str, str]] = []
+        if self.population_size > 1:
+            others = [self._drone_stats(d)["overall"] for d in self.drones]
+            pop_line = [(
+                f"Population: {self.population_size} drones   "
+                f"winner overall {overall:+.1f}   "
+                f"others avg {float(np.mean(others)):+.1f} / "
+                f"min {min(others):+.1f}",
+                "dim",
+            )]
         results_lines = [
             (title, "title"),
             (f"Stage: {self.cfg.stage}" +
              ("   ·   no base model — results are a training-machinery check" if is_test else ""),
              "dim"),
+            *pop_line,
             ("", "dim"),
             (f"Grade:    {grade}  ({GRADE_NAMES.get(grade,'')})", "accent"),
             (f"Overall:  {overall:+.1f}   (consistency-weighted, drives the grade)", "text"),
@@ -331,30 +496,34 @@ class TrainerUI:
         return os.path.join(stage_dir, generate_model_name(grade, "flycontrol", version))
 
     def _current_grade(self) -> str:
-        """Grade from the consistency-weighted overall score, not raw best.
-        Keeps a policy from earning an S-tier filename on the strength of
-        one freak episode when the other 999 tumbled."""
-        if not self._all_rewards:
+        """Grade from the consistency-weighted overall score of the
+        current leader. Keeps a policy from earning an S-tier filename on
+        the strength of one freak episode when the rest tumbled."""
+        winner = self._winner_drone()
+        if not winner.all_rewards:
             return score_to_flycontrol_grade(0.0)
-        avg = float(np.mean(self._all_rewards))
-        std = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
-        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else avg
-        return score_to_flycontrol_grade(consistency_score(best, avg, std))
+        st = self._drone_stats(winner)
+        return score_to_flycontrol_grade(st["overall"])
 
     def _log_run(self) -> None:
         minutes = (time.monotonic() - self._start_time) / 60.0
-        avg = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
-        std = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
-        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        overall = consistency_score(best, avg, std) if self._all_rewards else 0.0
-        grade = score_to_flycontrol_grade(overall) if self._all_rewards else score_to_flycontrol_grade(0.0)
+        winner = self._winner_drone()
+        st = self._drone_stats(winner)
+        avg, std, best, overall = st["avg"], st["std"], st["best"], st["overall"]
+        grade = (
+            score_to_flycontrol_grade(overall) if winner.all_rewards
+            else score_to_flycontrol_grade(0.0)
+        )
         # A fresh-base run (test_run or no base_model_name) is tagged
         # "test" so the runs.csv reader can filter it out when comparing
-        # real curriculum steps.
+        # real curriculum steps. Population mode adds a "popN" tag so
+        # the run log makes the parallel-evolution context obvious.
         is_test = self.cfg.test_run or not self.base_model_name
         tag = self.cfg.run_tag or ""
         if is_test and "test" not in tag.split(","):
             tag = f"{tag},test".lstrip(",")
+        if self.population_size > 1:
+            tag = f"{tag},pop{self.population_size}".lstrip(",")
         rec = RunRecord(
             module="flycontrol",
             stage=self.cfg.stage,
@@ -382,15 +551,22 @@ class TrainerUI:
         happening (BC can take a few seconds and the drone is not
         moving on-screen while the SL epochs churn). Returns False if
         the user closed the window during warm-up.
+
+        In population mode, BC runs once on drone 0 and the rest of the
+        population is then re-cloned + mutated from the warmed-up agent
+        so every drone inherits hover competence without paying the BC
+        cost N times.
         """
         from drone_ai.modules.flycontrol.pd_controller import collect_pd_rollouts
+
+        seed_drone = self.drones[0]
 
         # --- collect rollouts from the PD controller ---
         self._bc_status = "Collecting PD rollouts…"
         self._render_frame()
         self.renderer.flip()
         pd_obs, pd_acts = collect_pd_rollouts(
-            self.env,
+            seed_drone.env,
             n_episodes=self.cfg.bc_episodes,
             max_steps=1500,
             seed=self.cfg.seed,
@@ -400,6 +576,7 @@ class TrainerUI:
 
         if len(pd_obs) == 0:
             self._bc_status = None
+            self._diversify_population()
             return True
 
         # --- SL pretraining ---
@@ -419,7 +596,7 @@ class TrainerUI:
             self.renderer.flip()
 
         try:
-            stats = self.agent.bc_warmup(
+            stats = seed_drone.agent.bc_warmup(
                 pd_obs, pd_acts,
                 n_epochs=n_epochs,
                 batch_size=128,
@@ -432,70 +609,87 @@ class TrainerUI:
             return False
         finally:
             self._bc_status = None
+        # Re-seed the population from the warmed-up drone 0 so peers
+        # inherit hover competence, then mutate to diversify.
+        self._diversify_population()
         return running[0]
 
-    def _collect_step(self):
-        action, info = self.agent.select_action(self.obs, deterministic=False)
-        next_obs, reward, terminated, truncated, _ = self.env.step(action)
+    def _collect_step(self, d: _DroneSlot) -> None:
+        action, info = d.agent.select_action(d.obs, deterministic=False)
+        next_obs, reward, terminated, truncated, _ = d.env.step(action)
         done = bool(terminated or truncated)
-        self.agent.store(self.obs, action, float(reward), info["value"], info["log_prob"], done)
+        d.agent.store(d.obs, action, float(reward), info["value"], info["log_prob"], done)
 
-        self.ep_reward += float(reward)
-        self.ep_len += 1
-        self.steps_since_update += 1
-        self.obs = next_obs
+        d.ep_reward += float(reward)
+        d.ep_len += 1
+        d.steps_since_update += 1
+        d.obs = next_obs
 
         if done:
-            self.recent_rewards.append(self.ep_reward)
-            self._all_rewards.append(self.ep_reward)
-            if len(self.recent_rewards) > 20:
-                self.recent_rewards.pop(0)
-            if self.ep_reward > self.best_ep_reward:
-                self.best_ep_reward = self.ep_reward
-            self.ep_reward = 0.0
-            self.ep_len = 0
-            self.episode_idx += 1
-            self.obs, _ = self.env.reset(seed=self.cfg.seed + self.episode_idx)
+            d.recent_rewards.append(d.ep_reward)
+            d.all_rewards.append(d.ep_reward)
+            if len(d.recent_rewards) > 20:
+                d.recent_rewards.pop(0)
+            if d.ep_reward > d.best_ep_reward:
+                d.best_ep_reward = d.ep_reward
+            d.ep_reward = 0.0
+            d.ep_len = 0
+            d.episode_idx += 1
+            # Per-drone seed offset keeps drones from synchronising onto
+            # the same episode RNG even when their indices line up.
+            d.obs, _ = d.env.reset(seed=self.cfg.seed + d.episode_idx * len(self.drones))
 
-    def _do_update(self):
+    def _do_update(self, d: _DroneSlot) -> None:
         try:
-            stats = self.agent.update(self.obs)
-            self.latest_loss = stats.get("loss")
+            stats = d.agent.update(d.obs)
+            d.latest_loss = stats.get("loss")
         except Exception as e:
             print(f"[trainer] update skipped: {e}")
-        self.steps_since_update = 0
-        self.update_idx += 1
+        d.steps_since_update = 0
+        d.update_idx += 1
 
     # ------------------------------------------------------------------
 
     def _render_frame(self):
-        avg_recent = (sum(self.recent_rewards) / len(self.recent_rewards)) if self.recent_rewards else 0.0
-        avg_all = float(np.mean(self._all_rewards)) if self._all_rewards else 0.0
-        std_all = float(np.std(self._all_rewards)) if len(self._all_rewards) > 1 else 0.0
-        best = self.best_ep_reward if self.best_ep_reward != -float("inf") else 0.0
-        overall = (
-            consistency_score(best, avg_all, std_all) if self._all_rewards else 0.0
+        leader_idx = self._leader_index()
+        leader = self.drones[leader_idx]
+        self._leader_idx_cache = leader_idx
+        avg_recent = (
+            sum(leader.recent_rewards) / len(leader.recent_rewards)
+            if leader.recent_rewards else 0.0
+        )
+        st = self._drone_stats(leader)
+        avg_all, std_all, best, overall = (
+            st["avg"], st["std"], st["best"], st["overall"]
         )
         grade = (
-            score_to_flycontrol_grade(overall) if self._all_rewards else "—"
+            score_to_flycontrol_grade(overall) if leader.all_rewards else "—"
         )
         minutes = (time.monotonic() - self._start_time) / 60.0
         metrics = [
             ("update",  f"{self.update_idx}/{self.cfg.total_updates}", None),
-            ("buffer",  f"{self.steps_since_update}/{self.cfg.steps_per_update}", None),
-            ("episode", str(self.episode_idx), None),
-            ("ep step", str(self.ep_len), None),
-            ("ep R",    f"{self.ep_reward:+.1f}", None),
+            ("buffer",  f"{leader.steps_since_update}/{self.cfg.steps_per_update}", None),
+            ("episode", str(leader.episode_idx), None),
+            ("ep step", str(leader.ep_len), None),
+            ("ep R",    f"{leader.ep_reward:+.1f}", None),
             ("avg R",   f"{avg_recent:+.1f}", None),
             ("std R",   f"{std_all:.1f}", None),
-            ("overall", f"{overall:+.1f}" if self._all_rewards else "—", None),
+            ("overall", f"{overall:+.1f}" if leader.all_rewards else "—", None),
             ("best R",  f"{best:+.1f}"
-                        if self.best_ep_reward != -float("inf") else "—", None),
+                        if leader.best_ep_reward != float("-inf") else "—", None),
             ("grade",   grade, None),
             ("time",    f"{minutes:.1f} min", None),
         ]
-        if self.latest_loss is not None:
-            metrics.append(("loss", f"{self.latest_loss:.3f}", None))
+        if leader.latest_loss is not None:
+            metrics.append(("loss", f"{leader.latest_loss:.3f}", None))
+        if self.population_size > 1:
+            others_overall = [self._drone_stats(d)["overall"] for d in self.drones]
+            metrics.append((
+                "pop", f"#{leader_idx+1}/{self.population_size}", None,
+            ))
+            metrics.append((
+                "pop avg", f"{float(np.mean(others_overall)):+.1f}", None,
+            ))
 
         subtitle = self.stage_def["subtitle"]
         if self.base_model_name:
@@ -504,6 +698,8 @@ class TrainerUI:
             # No base — label as a test run so the user can tell at a
             # glance this isn't a real curriculum step.
             subtitle = f"{subtitle}   •   base: fresh (TEST)"
+        if self.population_size > 1:
+            subtitle = f"{subtitle}   •   pop: {self.population_size}"
         if self._bc_status is not None:
             subtitle = f"{subtitle}   •   {self._bc_status}"
         title_prefix = "TEST TRAINING" if (self.cfg.test_run or not self.base_model_name) else "TRAINING"
@@ -512,14 +708,25 @@ class TrainerUI:
             "subtitle": subtitle,
             "metrics":  metrics,
         }
+        # Peer markers: every non-leader drone is rendered as a small
+        # colored dot at its current world position, so the user can
+        # watch the population diverge / converge in real time.
+        peers: List[Tuple[np.ndarray, Tuple[int, int, int]]] = []
+        if self.population_size > 1:
+            for i, d in enumerate(self.drones):
+                if i == leader_idx:
+                    continue
+                color = PEER_COLORS[i % len(PEER_COLORS)]
+                peers.append((np.asarray(d.env.physics.state.position), color))
         self.renderer.draw_scene(
-            state=self.env.physics.state,
-            target=self.env.target,
+            state=leader.env.physics.state,
+            target=leader.env.target,
             path=None,
-            world=self.env.world,
-            trail=self.env.position_history,
-            waypoints=self.env.waypoints if self.env.waypoints else None,
+            world=leader.env.world,
+            trail=leader.env.position_history,
+            waypoints=leader.env.waypoints if leader.env.waypoints else None,
             hud=hud,
+            peer_drones=peers if peers else None,
         )
 
 

@@ -30,6 +30,15 @@ metrics, and pass/fail indicators. Keyboard: **Space** play/pause,
 **→** step, **+/−** speed, **Esc** close. Details in
 [inspector_ui.md](inspector_ui.md).
 
+For FlyControl cards specifically, the launcher menu also accepts:
+
+- **`+ / −`** — adjust the update budget for the run
+- **`P`** — cycle the population (1 → 2 → 4 → 6 → 8 → 12). With
+  `population > 1`, that many drones train in parallel inside one
+  window; the best policy is saved at the end. See
+  [modules/flycontrol.md](modules/flycontrol.md#live-population-mode-in-the-launcher)
+  for details.
+
 ## 3. Run the demo
 
 No training required — this uses an untrained agent + PD controller fallback:

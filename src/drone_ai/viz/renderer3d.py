@@ -307,6 +307,7 @@ class Renderer:
         trail: Optional[Sequence[np.ndarray]] = None,
         waypoints: Optional[Sequence[np.ndarray]] = None,
         hud: Optional[dict] = None,
+        peer_drones: Optional[Sequence[Tuple[np.ndarray, Tuple[int, int, int]]]] = None,
     ):
         # Animate props (independent of sim)
         self._prop_phase = (self._prop_phase + 0.6) % (2 * math.pi)
@@ -337,6 +338,11 @@ class Renderer:
             self._add_path(path, waypoints)
         if target is not None:
             self._add_target_marker(target)
+        # Peer drones (population members other than the followed leader)
+        # render before the leader so the leader sits on top visually.
+        if peer_drones:
+            for pos, color in peer_drones:
+                self._add_peer_marker(pos, color)
         self._add_drone(state)
 
         self._drawlist.sort(key=lambda d: -d.depth)
@@ -344,6 +350,31 @@ class Renderer:
 
         if self.show_hud:
             self._draw_hud(state, hud)
+
+    def _add_peer_marker(self, pos: np.ndarray, color: Tuple[int, int, int]) -> None:
+        """Tiny X marker for non-leader population drones. We don't draw
+        the full quad model — that would be expensive for N drones and
+        would clutter the scene. A colored cross at the position is
+        enough to read where each peer is."""
+        a = self.projector.project(np.asarray(pos))
+        if a is None:
+            return
+        x, y, depth = a
+        size = 6
+        self._drawlist.append(_Drawable(
+            depth=depth - 0.05, kind='line',
+            points=[(x - size, y - size), (x + size, y + size)],
+            color=color, width=2,
+        ))
+        self._drawlist.append(_Drawable(
+            depth=depth - 0.05, kind='line',
+            points=[(x - size, y + size), (x + size, y - size)],
+            color=color, width=2,
+        ))
+        self._drawlist.append(_Drawable(
+            depth=depth - 0.05, kind='dot',
+            points=[(x, y)], color=color, width=3,
+        ))
 
     # ---- Sky / ground ---------------------------------------------------
 

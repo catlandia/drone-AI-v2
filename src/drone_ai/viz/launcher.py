@@ -73,6 +73,18 @@ SECTIONS = [
     ("phase2",     "Phase 2 Ops + Demo"),
 ]
 
+# Cycle for the [P] population key on the menu. 1 = single-drone (the
+# original behavior). Higher values run a parallel population inside the
+# same TrainerUI window — see `TrainerUI.population_size`.
+POPULATION_STEPS: List[int] = [1, 2, 4, 6, 8, 12]
+
+
+def _next_population_step(current: int) -> int:
+    if current in POPULATION_STEPS:
+        i = POPULATION_STEPS.index(current)
+        return POPULATION_STEPS[(i + 1) % len(POPULATION_STEPS)]
+    return POPULATION_STEPS[0]
+
 
 # Per-FlyControl-stage warm-start dirs: this stage's own dir (resume)
 # plus every earlier stage in the chain (curriculum step-up).
@@ -210,7 +222,12 @@ def _scan_checkpoints(base_dirs: List[str]) -> List[Tuple[str, str]]:
 
 # ---- Per-card runner ------------------------------------------------------
 
-def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> None:
+def _run_card(
+    card: StageCard,
+    base_path: Optional[str],
+    total_updates: int,
+    population: int = 1,
+) -> None:
     """Execute the work for a card.
 
     Every card now opens its own full-screen inspector so the user can
@@ -239,6 +256,7 @@ def _run_card(card: StageCard, base_path: Optional[str], total_updates: int) -> 
             hold_on_finish=True,
             test_run=is_test,
             run_tag=tag,
+            population=max(1, int(population)),
         )
         TrainerUI(cfg).run()
         return
@@ -351,6 +369,11 @@ class Launcher:
         self.hover_idx: Optional[int] = None
         self.selected_idx: int = 0
         self.total_updates = 400
+        # Population size for FlyControl training. 1 = single-drone (the
+        # original behavior). N > 1 trains N drones in parallel inside
+        # the same window, picks the best at the end. The cycle steps
+        # land on values that look natural: 1, 2, 4, 6, 8, 12.
+        self.population: int = 1
         self._recent_runs: List[Dict[str, str]] = _load_recent_runs()
         self._latest_ckpt: Dict[str, str] = _latest_flycontrol_per_stage()
 
@@ -425,6 +448,8 @@ class Launcher:
                     self.total_updates = min(10000, self.total_updates + 100)
                 elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     self.total_updates = max(50, self.total_updates - 100)
+                elif ev.key == pygame.K_p:
+                    self.population = _next_population_step(self.population)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if self.hover_idx is not None:
                     self.selected_idx = self.hover_idx
@@ -499,7 +524,7 @@ class Launcher:
         # results modal so we don't need the launcher's RESULTS state.
         pygame.display.quit()
         try:
-            _run_card(card, path, self.total_updates)
+            _run_card(card, path, self.total_updates, self.population)
         except Exception as e:
             print(f"[launcher] card '{card.key}' raised: {e}")
             traceback.print_exc()
@@ -633,13 +658,18 @@ class Launcher:
         self.screen.blit(sub, (40, 78))
 
         budget_y = 110
+        pop_suffix = (
+            f"   ·   population: {self.population} drones"
+            if self.population > 1 else ""
+        )
         budget = self.font_md.render(
-            f"FlyControl training budget: {self.total_updates} updates",
+            f"FlyControl training budget: {self.total_updates} updates{pop_suffix}",
             True, TEXT_DIM,
         )
         self.screen.blit(budget, (40, budget_y))
         hint = self.font_sm.render(
-            "  [+/-] adjust budget   [Enter] open picker   [Esc/Q] quit",
+            "  [+/-] adjust budget   [P] cycle population   "
+            "[Enter] open picker   [Esc/Q] quit",
             True, TEXT_DIM,
         )
         self.screen.blit(hint, (40, budget_y + 18))
@@ -829,8 +859,13 @@ class Launcher:
         # Footer
         footer_y = rect.bottom - 36
         if card.section == "flycontrol":
-            tip = (f"  Budget: {self.total_updates} updates  "
-                   "[↑/↓] pick  [Enter] launch  [Esc] back")
+            pop_suffix = (
+                f"  ·  pop {self.population}" if self.population > 1 else ""
+            )
+            tip = (
+                f"  Budget: {self.total_updates} updates{pop_suffix}  "
+                "[↑/↓] pick  [Enter] launch  [Esc] back"
+            )
         else:
             tip = "  [↑/↓] pick  [Enter] launch  [Esc] back"
         self.screen.blit(self.font_sm.render(tip, True, TEXT_DIM), (rect.x + 24, footer_y))
@@ -1013,6 +1048,12 @@ def main():
         "--warm-start", default=None,
         help="Optional explicit warm-start checkpoint path for FlyControl stages.",
     )
+    parser.add_argument(
+        "--population", type=int, default=1,
+        help=("Number of drones to train in parallel inside the FlyControl "
+              "viz (1 = single-drone, default). Picks the best of population "
+              "at the end and saves that one. Ignored for non-FlyControl cards."),
+    )
     args = parser.parse_args()
 
     if args.stage:
@@ -1024,6 +1065,7 @@ def main():
                     total_updates=args.updates,
                     warm_start_path=args.warm_start,
                     hold_on_finish=True,
+                    population=max(1, int(args.population)),
                 )
                 TrainerUI(cfg).run()
             else:
@@ -1033,7 +1075,7 @@ def main():
                     print(f"Unknown stage: {args.stage}", file=sys.stderr)
                     exit_code = 2
                 else:
-                    _run_card(card, args.warm_start, args.updates)
+                    _run_card(card, args.warm_start, args.updates, args.population)
         finally:
             try:
                 pygame.quit()
