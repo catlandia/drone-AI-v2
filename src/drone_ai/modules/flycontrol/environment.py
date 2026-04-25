@@ -302,13 +302,17 @@ class FlyControlEnv(gym.Env):
             reward += 0.05
 
         # Yaw-rate penalty — without this the reward function gives
-        # the policy no gradient signal to stop spinning. Drones early
-        # in training drift into spiral attractors (constant yaw rate
-        # combined with thrust = circular ascent) because spinning
-        # neither helps nor hurts the score. Quadratic in rad/s so
-        # mild yaw is essentially free and only fast spinning bites.
+        # the policy no gradient signal to stop spinning. Linear in
+        # |yaw_rate| with a small coefficient: at 5 rad/s the cost is
+        # -0.025/step, at 10 rad/s it's -0.05/step. The earlier
+        # quadratic version (-0.005 * ω²) hammered a fast-spinning
+        # drone for -0.125/step = -187 over a 1500-step episode,
+        # which let a single bad mutation crater into W tier on the
+        # yaw penalty alone before any selection pressure could cull
+        # it. Mild yaw is nearly free; the gradient still pushes
+        # toward calm flight without crushing exploration.
         yaw_rate = float(state.angular_velocity[2])
-        reward -= 0.005 * yaw_rate * yaw_rate
+        reward -= 0.005 * abs(yaw_rate)
 
         # Time penalty. Raised from -0.01 to -0.02 so pure survival is
         # net-negative unless the policy is actually earning shaping —

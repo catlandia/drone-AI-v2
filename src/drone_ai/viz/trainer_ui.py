@@ -189,12 +189,14 @@ class TrainConfig:
     # trains in parallel and the best-of-N is saved at the end. Only
     # has effect when population > 1.
     #
-    # Bumped from 25 to 50: at 25 each drone only had ~8-10 episodes
-    # between culls, and ranking on a 20-episode recent window with
-    # such few samples meant fitness was dominated by single-episode
-    # luck. Selection oscillated, the leader kept changing, and grades
-    # bounced around the noise floor instead of climbing.
-    evolve_every: int = 50
+    # Set to 30 per-drone updates. With pop=6 the first evolution
+    # fires after ~180 total updates and ~15 episodes of data per
+    # drone — enough signal to tell good mutations from bad without
+    # making the user wait through a long pre-selection chaos phase
+    # where every drone (good or bad) is still in the population.
+    # The earlier value of 50 delayed the first cull to ~300 total
+    # updates, which felt like nothing was happening early on.
+    evolve_every: int = 30
     # Per-drone PPO buffer-size jitter. Each drone gets
     # `steps_per_update + i * stagger_steps` so their PPO updates fire
     # on different ticks instead of all clumping on the same frame.
