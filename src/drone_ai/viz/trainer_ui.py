@@ -328,19 +328,13 @@ class TrainerUI:
             )
 
     def _leader_index(self) -> int:
-        """Drone with the highest recent-mean reward; falls back to the
-        first drone if nobody has finished an episode yet. Camera and
-        HUD follow this index, and it's recomputed every frame so the
-        leader can change as the run progresses."""
+        """Drone with the highest current fitness. Camera and HUD
+        follow this index, recomputed every frame so the leader can
+        change as the population evolves."""
         best_idx = 0
         best_score = float("-inf")
         for i, d in enumerate(self.drones):
-            if d.recent_rewards:
-                score = sum(d.recent_rewards) / len(d.recent_rewards)
-            elif d.best_ep_reward != float("-inf"):
-                score = d.best_ep_reward
-            else:
-                score = float("-inf")
+            score = self._drone_fitness(d)
             if score > best_score:
                 best_score = score
                 best_idx = i
@@ -349,13 +343,31 @@ class TrainerUI:
     def _total_updates_done(self) -> int:
         return sum(d.update_idx for d in self.drones)
 
+    def _drone_fitness(self, d: _DroneSlot) -> float:
+        """Current fitness for evolution ranking and leader selection.
+
+        Uses the mean of `recent_rewards` (sliding window of the last 20
+        episodes) — *not* the cumulative consistency score over the
+        whole run. The cumulative version reward early luck and let a
+        degrading champion stay on top forever, which broke mid-run
+        evolution: the BC-warmed lineage kept being preserved while
+        successful mutations were culled because they carried the
+        failed episode history of whichever drone they replaced.
+        """
+        if d.recent_rewards:
+            return sum(d.recent_rewards) / len(d.recent_rewards)
+        if d.best_ep_reward != float("-inf"):
+            return d.best_ep_reward
+        return float("-inf")
+
     def _maybe_evolve(self) -> None:
         """Mid-run evolution. Once every drone has done at least
         `cfg.evolve_every` PPO updates since the last cull, rank by
-        consistency score and replace the bottom half with mutated
-        clones of the top half. The replaced drones reset their PPO
-        buffer + recent-rewards stats since they're now new policies;
-        their env keeps flying so the viz doesn't teleport.
+        current fitness (recent-window mean) and replace the bottom
+        half with mutated clones of the top half. Replaced drones get
+        a complete fresh-slate reset — their predecessor's reward
+        history shouldn't poison the new policy's selection signal.
+        Their env keeps flying so the viz doesn't teleport.
 
         Skipped when population is too small to evolve (need at least 2
         survivors and 1 victim) or when evolve_every == 0.
@@ -372,7 +384,7 @@ class TrainerUI:
 
         ranked = sorted(
             range(n),
-            key=lambda i: self._drone_stats(self.drones[i])["overall"],
+            key=lambda i: self._drone_fitness(self.drones[i]),
             reverse=True,
         )
         n_keep = max(1, n // 2)
@@ -387,9 +399,14 @@ class TrainerUI:
             )
             slot = self.drones[victim_idx]
             slot.agent = child
-            # Clear PPO buffer + recent-fitness stats: the new policy
-            # shouldn't be judged on the old one's last 20 episodes.
+            # Full fresh-slate reset for the new policy. Without this,
+            # the predecessor's failed episodes stayed in all_rewards
+            # and best_ep_reward, so a great mutation got dragged down
+            # by a history it didn't earn.
             slot.recent_rewards = []
+            slot.all_rewards = []
+            slot.best_ep_reward = float("-inf")
+            slot.episode_idx = 0
             slot.steps_since_update = 0
             slot.latest_loss = None
             slot.last_evolve_update = slot.update_idx
@@ -402,11 +419,11 @@ class TrainerUI:
             )
 
         if survivors:
-            top_score = self._drone_stats(self.drones[survivors[0]])["overall"]
+            top_fit = self._drone_fitness(self.drones[survivors[0]])
             print(
                 f"[evolve] gen mark @ updates={self._total_updates_done()}: "
                 f"survivors={survivors}, victims={victims}, "
-                f"top overall={top_score:+.1f}"
+                f"top recent={top_fit:+.1f}"
             )
 
     # Convenience properties for the rendering / results / log code that
@@ -513,12 +530,16 @@ class TrainerUI:
         return {"avg": avg, "std": std, "best": best, "overall": overall}
 
     def _winner_drone(self) -> _DroneSlot:
-        """Pick the population member with the highest consistency score.
-        Ties broken by best episode reward."""
+        """Pick the population member to save. Ranks by current fitness
+        (recent-window mean) so a drone that started strong but is now
+        degraded doesn't win on the strength of stale episodes; ties
+        broken by cumulative consistency score."""
         scored = sorted(
             self.drones,
-            key=lambda d: (self._drone_stats(d)["overall"],
-                           self._drone_stats(d)["best"]),
+            key=lambda d: (
+                self._drone_fitness(d),
+                self._drone_stats(d)["overall"],
+            ),
             reverse=True,
         )
         return scored[0]
