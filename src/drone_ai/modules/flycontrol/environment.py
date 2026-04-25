@@ -276,11 +276,28 @@ class FlyControlEnv(gym.Env):
         # it out" exploit. The crash model intentionally allows soft
         # touchdowns so the drone can actually land, but a grounded
         # drone that isn't completing a delivery is idling on purpose.
+        # Raised to -0.10 (with the -0.02 time penalty that's -0.12/step
+        # = -180 over the 1500-step hover episode). At -0.04/step the
+        # cumulative penalty was only on par with a single crash, so
+        # population mutations that landed-and-sat scored about the
+        # same as ones that occasionally crashed mid-air — local optima
+        # the BC-warmed lineage couldn't escape with shallow per-drone
+        # PPO budgets. Now landing is strictly worse than crashing.
         at_delivery_touchdown = (
             self.task == TaskType.DELIVERY and self.carrying and dist < 1.5
         )
         if not airborne and not at_delivery_touchdown:
-            reward -= 0.02
+            reward -= 0.10
+
+        # Airborne baseline bonus — being upright and in the flight
+        # envelope (z ≥ 3 m, well above the 0.3 m airborne threshold)
+        # earns a small per-step reward regardless of horizontal
+        # distance from target. This makes "stay in the air, even if
+        # you can't reach the target" strictly better than "land,"
+        # which in turn pushes the gradient toward exploration in 3D
+        # rather than collapse onto the floor.
+        if airborne and upright and pos[2] >= 3.0:
+            reward += 0.05
 
         # Time penalty. Raised from -0.01 to -0.02 so pure survival is
         # net-negative unless the policy is actually earning shaping —
