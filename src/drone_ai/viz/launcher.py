@@ -227,6 +227,7 @@ def _run_card(
     base_path: Optional[str],
     total_updates: int,
     population: int = 1,
+    force_fresh: bool = False,
 ) -> None:
     """Execute the work for a card.
 
@@ -253,6 +254,7 @@ def _run_card(
             stage=card.key,
             total_updates=total_updates,
             warm_start_path=base_path,
+            force_fresh=force_fresh,
             hold_on_finish=True,
             test_run=is_test,
             run_tag=tag,
@@ -522,9 +524,17 @@ class Launcher:
         # module). Tear down the launcher display, run the card, then
         # re-init and come back to MENU. Each inspector shows its own
         # results modal so we don't need the launcher's RESULTS state.
+        # Picker convention: only the "(fresh)" option carries path=None.
+        # Every other option (including "(auto)") has an actual checkpoint
+        # path. So path is None  ⇔  user explicitly picked fresh, and
+        # we must block the curriculum-chain auto-resolve fallback.
+        force_fresh = path is None
         pygame.display.quit()
         try:
-            _run_card(card, path, self.total_updates, self.population)
+            _run_card(
+                card, path, self.total_updates, self.population,
+                force_fresh=force_fresh,
+            )
         except Exception as e:
             print(f"[launcher] card '{card.key}' raised: {e}")
             traceback.print_exc()

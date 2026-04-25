@@ -143,6 +143,14 @@ class TrainConfig:
     # so the user can pin the base model instead of accepting the
     # automatic choice.
     warm_start_path: Optional[str] = None
+    # When True, *never* warm-start — not from the explicit path, not
+    # from the curriculum-chain fallback (resolve_warm_start). Set by
+    # the launcher when the user explicitly picks "(fresh)" in the
+    # pre-launch picker. Without this, picking fresh still triggered
+    # resolve_warm_start, so every "fresh" run silently inherited the
+    # latest disk checkpoint — including stale value functions from
+    # before reward-shaping changes.
+    force_fresh: bool = False
     # If True, after training completes the trainer holds the window
     # open on a results screen until the user dismisses it. The launcher
     # turns this on so missions don't auto-exit the moment they finish.
@@ -258,7 +266,10 @@ class TrainerUI:
         #      on top of delivery_route instead of training from scratch.
         self.base_model_name: Optional[str] = None
         models_root = os.path.dirname(cfg.log_path) or "models"
-        warm = cfg.warm_start_path or resolve_warm_start(models_root, cfg.stage)
+        if cfg.force_fresh:
+            warm = None
+        else:
+            warm = cfg.warm_start_path or resolve_warm_start(models_root, cfg.stage)
         if warm is not None:
             try:
                 seed_agent.load(warm)
