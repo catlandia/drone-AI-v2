@@ -232,16 +232,32 @@ class FlyControlEnv(gym.Env):
         can_shape = airborne and upright
 
         if self.task == TaskType.HOVER:
-            # Two-band shaping, gated on can_shape so a grounded drone
-            # earns zero and must re-launch to score. Far-band
-            # coefficient reduced (0.5 → 0.3) so even in the air the
-            # far band can't accumulate into an exploitable pile.
+            # Three-band shaping, gated on can_shape so a grounded drone
+            # earns zero and must re-launch to score.
+            #
+            # Design goal: lazy mid-distance hovering should pay
+            # *much less* than reaching the target — but the gradient
+            # toward target needs to exist at every distance so the
+            # policy has something to follow. Solved with three bands:
+            #
+            #   far  — 0.3 * (1 - d/30)  : gentle gradient out to 30 m,
+            #                              never enough alone to be
+            #                              an attractor (max 0.3/step
+            #                              even at dist=0)
+            #   close — (5 - d) * 0.4   : strong pull within 5 m,
+            #                              max 2.0/step at d=0
+            #   tight — +2.0           : big terminal reward at d<0.5
+            #
+            # Result: at d=15 the policy gets ~+0.15/step from far-band
+            # (clear nav signal) but only ~+195/episode total — far
+            # less attractive than the +6500 at d=0, ratio ~33×, so
+            # the gradient is monotonically toward target.
             if can_shape:
-                reward += max(0.0, 0.3 * (1.0 - dist / 20.0))
-                if dist < 2.0:
-                    reward += max(0.0, 2.0 - dist) * 0.5
-                if dist < 0.3:
-                    reward += 1.0
+                reward += max(0.0, 0.3 * (1.0 - dist / 30.0))
+                if dist < 5.0:
+                    reward += max(0.0, 5.0 - dist) * 0.4
+                if dist < 0.5:
+                    reward += 2.0
 
         elif self.task == TaskType.DELIVERY:
             if not self.carrying:
@@ -289,16 +305,21 @@ class FlyControlEnv(gym.Env):
         if not airborne and not at_delivery_touchdown:
             reward -= 0.10
 
-        # Airborne baseline bonus — being upright and inside the
-        # flight envelope earns a small per-step reward regardless of
-        # horizontal distance from target. This makes "stay in the
-        # air, even if you can't reach the target" strictly better
-        # than "land," pushing the gradient toward 3D exploration
-        # rather than collapse onto the floor. Capped at z ≤ 25 m so
-        # "spiral up forever" stops paying — without the cap the
-        # policy can find an attractor where it just gains altitude
-        # indefinitely, since +0.05/step at any altitude is positive.
-        if airborne and upright and 3.0 <= pos[2] <= 25.0:
+        # Altitude-tracking bonus — pay for being near the *target's*
+        # altitude, not just any altitude in the flight envelope. The
+        # previous unconditional bonus (z ∈ [3, 25]) created a "lazy
+        # attractor" where the drone got free reward for hanging at
+        # any altitude in that band, with no incentive to actually
+        # match target_z. Tying the band to the task target removes
+        # that attractor: a drone hovering at z=20 when target is at
+        # z=7 gets nothing.
+        #
+        # This generalizes cleanly across stages — every task sets
+        # self.target with a meaningful altitude, so the same logic
+        # works for hover/delivery/route without per-stage tuning.
+        # Future-proof against new tasks because it doesn't bake in
+        # an arbitrary altitude range.
+        if airborne and upright and abs(pos[2] - self.target[2]) < 5.0:
             reward += 0.05
 
         # Yaw-rate penalty — without this the reward function gives
