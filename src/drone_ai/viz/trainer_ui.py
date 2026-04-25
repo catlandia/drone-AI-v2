@@ -722,9 +722,15 @@ class TrainerUI:
         n_epochs = self.cfg.bc_epochs
         running = [True]
 
-        def cb(epoch: int, loss: float) -> None:
+        def cb(epoch: int, loss: float, phase: str = "actor") -> None:
             self._bc_loss = float(loss)
-            self._bc_status = f"BC epoch {epoch}/{n_epochs}   loss={loss:.4f}"
+            # Critic phase runs at half the actor's epoch count — see
+            # PPOAgent.bc_warmup. Adjust the displayed total so the
+            # progress bar doesn't look stalled at 50% during critic
+            # training.
+            total = n_epochs if phase == "actor" else max(1, n_epochs // 2)
+            label = "actor " if phase == "actor" else "critic"
+            self._bc_status = f"BC {label} epoch {epoch}/{total}   loss={loss:.4f}"
             # Pump events so the window stays responsive. The renderer
             # returning False means the user closed the window.
             alive = self.renderer.handle_events(0.0)

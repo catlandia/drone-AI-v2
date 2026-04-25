@@ -265,6 +265,9 @@ class PPOAgent:
             last_loss = float(np.mean(losses)) if losses else float("nan")
             if progress_cb is not None:
                 try:
+                    progress_cb(epoch + 1, last_loss, phase="actor")
+                except TypeError:
+                    # Older 2-arg cb signatures still work.
                     progress_cb(epoch + 1, last_loss)
                 except Exception:
                     pass
@@ -290,7 +293,12 @@ class PPOAgent:
             critic_params = list(self.policy.shared.parameters()) + \
                             list(self.policy.critic.parameters())
             crit_opt = optim.Adam(critic_params, lr=lr)
-            for epoch in range(n_epochs):
+            # Halve the critic epochs vs the actor's: the value function
+            # converges fast on a small PD-rollout dataset and a longer
+            # critic phase mostly added UI dead-time without measurable
+            # benefit on shallow per-drone budgets.
+            n_critic_epochs = max(1, n_epochs // 2)
+            for epoch in range(n_critic_epochs):
                 idx = torch.randperm(n, device=self.device)
                 losses = []
                 for start in range(0, n, batch_size):
@@ -306,6 +314,13 @@ class PPOAgent:
                     crit_opt.step()
                     losses.append(loss.item())
                 critic_loss = float(np.mean(losses)) if losses else float("nan")
+                if progress_cb is not None:
+                    try:
+                        progress_cb(epoch + 1, critic_loss, phase="critic")
+                    except TypeError:
+                        progress_cb(epoch + 1, critic_loss)
+                    except Exception:
+                        pass
 
         # Tighten exploration noise so the BC-learned policy isn't
         # drowned by sigma on the first stochastic rollouts.
